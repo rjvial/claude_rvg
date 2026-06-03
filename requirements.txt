@@ -1,0 +1,35 @@
+# Core deps.
+anthropic>=0.40
+google-auth>=2.23
+google-auth-oauthlib>=1.1
+google-auth-httplib2>=0.2
+google-api-python-client>=2.100
+lxml>=4.9
+beautifulsoup4>=4.12
+neo4j>=5.14
+tqdm>=4.66
+python-dateutil>=2.8
+
+# Local embedding model for graph-RAG retrieval (scripts/embed_messages.py).
+# Pulls torch + transformers — a large one-time install; CPU is fine for this
+# corpus size. The model itself (intfloat/multilingual-e5-large, ~2GB)
+# downloads on the first run of embed_messages.py.
+sentence-transformers>=3.0
+
+# talon's own transitive deps. We install talon with --no-deps below to avoid
+# the real cchardet (no Windows wheel for Python 3.10+, needs MSVC to compile).
+regex
+numpy
+scipy
+scikit-learn
+chardet
+cssselect
+html5lib
+
+# Drop-in cchardet replacement with prebuilt wheels for 3.10+. Provides the
+# `cchardet` module name talon imports at runtime.
+faust-cchardet
+
+# talon itself is NOT pinned here. After installing this file run:
+#     pip install --no-deps talon
+# (uncommented `talon` would make pip pull in real cchardet and break.)

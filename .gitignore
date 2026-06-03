@@ -1,0 +1,37 @@
+workspace/runs/
+
+# Pipeline data (emails, OAuth tokens, extraction output)
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env
+.env
+.env.local
+
+# MCP config — contains plaintext Neo4j password
+.mcp.json
+
+# Logs (pip output, script stderr captures, etc.)
+*.log
+
+# Editor / tooling (machine-specific paths, caches)
+.vscode/
+.ruff_cache/
+
+# Local Claude Code permission overrides (personal, not project config)
+.claude/settings.local.json
+
+# Source backups (scripts/*.py.bak)
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+.gstack/
