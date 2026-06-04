@@ -1969,7 +1969,13 @@ def _clear_spam_neo4j(unspammed: set[tuple[str, str]]) -> None:
                 UNWIND $rows AS row
                 MATCH (m:Message {gmail_message_id: row.mid,
                                   account_owner: row.acct})
-                SET m.label_ids =
+                SET m.bucket = CASE
+                        WHEN 'CATEGORY_PROMOTIONS' IN coalesce(m.label_ids, []) THEN 'promotions'
+                        WHEN 'CATEGORY_SOCIAL'     IN coalesce(m.label_ids, []) THEN 'social'
+                        WHEN 'CATEGORY_UPDATES'    IN coalesce(m.label_ids, []) THEN 'updates'
+                        WHEN 'CATEGORY_FORUMS'     IN coalesce(m.label_ids, []) THEN 'forums'
+                        ELSE 'primary' END,
+                    m.label_ids =
                     [x IN coalesce(m.label_ids, [])
                        WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'INBOX'
             """, rows=rows).consume()
@@ -1993,7 +1999,8 @@ def _set_spam_neo4j(spammed: set[tuple[str, str]]) -> None:
                 UNWIND $rows AS row
                 MATCH (m:Message {gmail_message_id: row.mid,
                                   account_owner: row.acct})
-                SET m.label_ids =
+                SET m.bucket = 'spam',
+                    m.label_ids =
                     [x IN coalesce(m.label_ids, [])
                        WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'SPAM'
             """, rows=rows).consume()

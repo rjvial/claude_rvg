@@ -39,6 +39,7 @@ from _common import (
     esc,
     force_utf8,
     gmail_search_url,
+    message_bucket,
     neo4j_driver,
 )
 
@@ -51,7 +52,7 @@ RETURN elementId(m) AS eid, m.subject AS subject, m.sent_at AS sent_at,
        m.snippet AS snippet, m.body_clean AS body, m.gmail_url AS gmail_url,
        m.rfc822_message_id AS rfc822, m.account_owner AS acct,
        m.gmail_message_id AS mid, t.gmail_thread_id AS tid,
-       m.label_ids AS labels
+       m.label_ids AS labels, m.bucket AS bucket
 """
 ALL_EDGES_CYPHER = """
 MATCH (a:Message)-[r:REPLY_TO|NEXT_IN_THREAD]->(b:Message)
@@ -139,6 +140,10 @@ def fetch(driver, lean: bool = False) -> tuple[dict, list, dict, dict]:
             "acct": r["acct"], "tid": r["tid"], "mid": r["mid"],
             "unread": "UNREAD" in (r["labels"] or []),
             "spam": "SPAM" in (r["labels"] or []),
+            # Treatment tier. Prefer the stored m.bucket; fall back to deriving
+            # it from labels so the UI is correct even before migrate_buckets.py
+            # has tagged legacy nodes (e.g. existing spam reads as bucket='spam').
+            "bucket": r["bucket"] or message_bucket(r["labels"]),
             "from": [], "to": [], "cc": [], "bcc": [], "atts": [],
         }
     edges = [(r["s"], r["t"], r["rt"]) for r in edge_rows]
@@ -247,6 +252,7 @@ def build_payload(driver, lean: bool = False) -> dict:
             "tid": m["tid"] or "",
             "unread": m["unread"],
             "spam": m["spam"],
+            "bucket": m["bucket"],
             "to": m["to"], "cc": m["cc"], "bcc": m["bcc"], "atts": m["atts"],
             "inline_img": (m["mid"], m["acct"]) in inline_img_set,
             "url": gmail_search_url(m["gmail_url"], m["rfc822"]),
@@ -523,10 +529,13 @@ PAGE = r"""<!DOCTYPE html>
   #hdr #markspambtn{background:#B0742E;color:#fff;border-color:#946326}
   #hdr #markspambtn:hover{background:#946326}
   #hdr #markspambtn:disabled{opacity:.55;cursor:default}
-  /* Spam page toggle — accent-highlighted while the spam view is active. */
-  #hdr #spambtn.on{background:var(--accent);color:#fff;
-    border-color:var(--accent-deep)}
-  #hdr #spambtn.on:hover{background:var(--accent-deep)}
+  /* Bucket (tier) filter — multi-select dropdown in the header bar, replacing
+     the old Spam toggle. Reuses the .acctf menu styling; sized to fit the bar
+     and accent-highlighted when a non-default tier set is active. */
+  #hdr .bucketf{position:relative;display:inline-block;width:auto;
+    vertical-align:middle}
+  #hdr .bucketf .btn{width:auto;min-width:104px}
+  #hdr .bucketf.active .btn{border-color:var(--accent);color:var(--accent)}
   #cols{position:absolute;top:46px;left:0;right:0;height:32px;z-index:5;
     display:flex;align-items:center;gap:9px;padding:0 16px;
     background:var(--surface);border-bottom:1px solid var(--line)}
@@ -1078,7 +1087,8 @@ PAGE = r"""<!DOCTYPE html>
   <button id="askbtn" title="Ask Liam about your mail">✦ Liam</button>
   <button id="composebtn" title="Compose a new message">✎ Compose</button>
   <button id="refresh" style="display:none" title="Pull new mail now">↻ Sync</button>
-  <button id="spambtn" title="Show spam mail">🛡 Spam</button>
+  <div class="acctf bucketf" id="bucketf"
+    title="Filter by mail bucket (primary vs promotions/social/updates/forums/spam)"></div>
   <button id="acctsbtn" title="Settings: email accounts, LLM model, Claude sign-in">⚙ Settings</button>
 </div>
 <div id="banner">↻ New mail synced — click to reload</div>
@@ -1310,6 +1320,22 @@ const ACCT_PAL = ["#3F9A74","#C0863C","#5670B4","#A368B8","#C25C54"];
 MSGS.forEach(m => { if(m.acct && !(m.acct in ACCT_COLOR))
   ACCT_COLOR[m.acct] = ACCT_PAL[Object.keys(ACCT_COLOR).length % ACCT_PAL.length]; });
 
+// Per-bucket (treatment-tier) dot colors + canonical display order. 'primary'
+// is real correspondence; the rest are lite tiers. See _common.message_bucket.
+const BUCKET_COLOR = {
+  primary:    "#2E9D58",   // green  — full treatment
+  promotions: "#E0A458",   // amber
+  social:     "#6F86D6",   // indigo
+  updates:    "#56C596",   // teal
+  forums:     "#C98BDB",   // purple
+  spam:       "#C25C54",   // red
+};
+const BUCKET_ORDER = ["primary","promotions","social","updates","forums","spam"];
+const BUCKET_LABELS = {
+  primary:"Primary", promotions:"Promotions", social:"Social",
+  updates:"Updates", forums:"Forums", spam:"Spam",
+};
+
 // conversations: convId -> [message index...]
 const CONV = {};
 MSGS.forEach((m, i) => (CONV[m.conv] || (CONV[m.conv] = [])).push(i));
@@ -1365,7 +1391,22 @@ const LROW = 28;
 let listIdx = MSGS.map((m, i) => i)
   .sort((a, b) => (MSGS[b].sent || "").localeCompare(MSGS[a].sent || ""));
 let view = listIdx, listCur = 0;        // listCur = highlighted row in view
-let spamView = false;                   // false = main mail · true = spam page
+// Bucket (treatment-tier) filter — a multi-select dropdown that replaces the
+// old Spam toggle. Default shows ONLY 'primary'; the lite tiers (promotions/
+// social/updates/forums/spam) are opt-in. 'primary' is always offered even if
+// no such message is currently loaded. `let` so _rebuildIndices can refresh the
+// option list after a payload swap; bucketSel (a Set, mutated in place) is
+// preserved across the swap, like acctSel.
+let BUCKETS = [...new Set(MSGS.map(m => m.bucket).filter(Boolean))]
+  .sort((a, b) => BUCKET_ORDER.indexOf(a) - BUCKET_ORDER.indexOf(b));
+if(!BUCKETS.includes("primary")) BUCKETS.unshift("primary");
+const bucketSel = new Set(["primary"]);   // default: only primary visible
+// "Filtered" means the selection differs from the primary-only default — used
+// for the ✕ Clear button and the subtitle. (matches() applies the filter
+// directly off bucketSel, so this is only about whether to *advertise* it.)
+function bucketFiltered(){
+  return !(bucketSel.size === 1 && bucketSel.has("primary"));
+}
 
 // --- search ----------------------------------------------------------
 // Bare words AND-match across every field; from:/to:/cc:/bcc:/subject:/
@@ -1503,7 +1544,8 @@ function computeHL(){
 }
 
 function anyFilter(){
-  return QTOK.length > 0 || acctOn() || Object.values(colF).some(v => v);
+  return QTOK.length > 0 || acctOn() || bucketFiltered()
+    || Object.values(colF).some(v => v);
 }
 function parseQuery(q){
   // → tokens, all ANDed: {f,v} field term · {v} free term · {has} filter
@@ -1544,9 +1586,12 @@ function matches(i){
   // mid|acct) keeps the view correct in the meantime, even across a refresh
   // that re-fetches a still-stale payload.
   if(REMOVED.size && REMOVED.has(remKey(m))) return false;
-  // Spam has its own page: the main list hides SPAM-labelled mail, the spam
-  // view shows only it.
-  if(spamView ? !m.spam : m.spam) return false;
+  // Bucket (tier) filter: only the currently-selected buckets are shown. The
+  // default selection is primary-only, so lite mail (promotions / social /
+  // updates / forums / spam) stays hidden until opted in via the header
+  // bucket dropdown. m.bucket is always one of BUCKETS, so an empty selection
+  // simply shows nothing (mirrors deselecting every account).
+  if(!bucketSel.has(m.bucket)) return false;
   for(const t of QTOK){
     if(t.has !== undefined){
       if((t.has.startsWith("att") || t.has.startsWith("file"))
@@ -1611,19 +1656,20 @@ function matches(i){
 }
 function updateSub(){
   if(thrOpen) return;
-  if(spamView){
-    const n = view.length;
-    $("sub").textContent = n.toLocaleString() + " spam message"
-      + (n === 1 ? "" : "s");
-    return;
-  }
-  if(anyFilter()){
+  // Filters other than the bucket tier (search, account, per-column).
+  const other = QTOK.length > 0 || acctOn() || Object.values(colF).some(v => v);
+  if(other || bucketFiltered()){
     $("sub").textContent = view.length.toLocaleString() + " of "
       + MSGS.length.toLocaleString() + " messages";
-  } else {
-    $("sub").textContent = MSGS.length.toLocaleString() + " messages · "
-      + Object.keys(CONV).length.toLocaleString() + " conversations";
+    return;
   }
+  // Default view: primary only, nothing else filtered. Headline counts what's
+  // visible, and flags how much lite mail is hidden so it's discoverable.
+  const hidden = MSGS.length - view.length;
+  let s = view.length.toLocaleString() + " messages · "
+    + Object.keys(CONV).length.toLocaleString() + " conversations";
+  if(hidden > 0) s += " · " + hidden.toLocaleString() + " lite hidden";
+  $("sub").textContent = s;
 }
 function rebuildList(){
   computeHL();
@@ -1632,11 +1678,10 @@ function rebuildList(){
   // second rebuildList (from ensureBodyHits) snaps to whole-body matching.
   _ensureBody();
   // Always run matches(): besides user-set filters it applies two always-on
-  // partitions — the just-trashed REMOVED set and the spam/inbox split
-  // (matches() hides SPAM-labelled mail from the inbox and everything else
-  // from the spam page). Gating this on anyFilter() let an unfiltered list
-  // bypass both, so the Spam button showed every message and trashed rows
-  // lingered until reload.
+  // partitions — the just-trashed REMOVED set and the bucket-tier filter
+  // (matches() hides any message whose bucket isn't selected; the default
+  // selection is primary-only). Gating this on anyFilter() would let an
+  // unfiltered list bypass both, leaking lite mail and lingering trashed rows.
   view = listIdx.filter(matches);
   listCur = 0;
   $("spacer").style.height = (view.length * LROW) + "px";
@@ -1843,15 +1888,16 @@ const remKey = m => m ? (m.mid + "|" + m.acct) : null;
 // the Remove button is hidden, and SELECTED is kept empty.
 let selectMode = false;
 
-// The two spam-reclassify buttons are view-specific: Not-spam only makes sense
-// on the spam page, Mark-spam only on the main page. Both need select mode on
-// and no conversation drilled in. Self-gating so it can be called from anywhere
-// the relevant state changes (select mode, spam toggle, thread back).
+// Both spam-reclassify buttons are available in select mode (no conversation
+// drilled in). With the unified bucket filter there's no single "spam view" to
+// key off, so visibility is just select-mode; syncSelectionUI() then ENABLES
+// each only when the selection contains relevant rows (Not-spam ⇐ some spam
+// selected, Mark-spam ⇐ some non-spam selected). Self-gating so it can be
+// called from anywhere the relevant state changes (select mode, thread back).
 function updateSpamButtons(){
-  $("notspambtn").style.display =
-    (selectMode && spamView && !thrOpen) ? "inline-block" : "none";
-  $("markspambtn").style.display =
-    (selectMode && !spamView && !thrOpen) ? "inline-block" : "none";
+  const show = (selectMode && !thrOpen) ? "inline-block" : "none";
+  $("notspambtn").style.display = show;
+  $("markspambtn").style.display = show;
 }
 
 function enterSelectMode(){
@@ -2128,9 +2174,12 @@ async function markNotSpamSelected(){
         + d.failed.slice(0,3).map(f => `  ${f.mid}: ${f.error}`).join("\n")
         + (d.failed.length > 3 ? `\n  …and ${d.failed.length - 3} more` : ""));
     }
-    for(const i of targets) MSGS[i].spam = false;   // optimistic: leaves spam page
+    // optimistic: leaves the spam bucket. We can't know the original category
+    // client-side, so assume 'primary' (the common case); a later payload
+    // refresh corrects it from the server-derived bucket if it was categorized.
+    for(const i of targets){ MSGS[i].spam = false; MSGS[i].bucket = "primary"; }
     exitSelectMode();          // clears SELECTED, hides the select-mode buttons
-    rebuildList();             // re-filter (spam view drops them; inbox keeps)
+    rebuildList();             // re-filter (spam bucket drops them; primary keeps)
     triggerFullSync();         // pull every account so server truth catches up
   }catch(e){
     alert("Network error: " + e);
@@ -2177,9 +2226,10 @@ async function markAsSpamSelected(){
         + d.failed.slice(0,3).map(f => `  ${f.mid}: ${f.error}`).join("\n")
         + (d.failed.length > 3 ? `\n  …and ${d.failed.length - 3} more` : ""));
     }
-    for(const i of targets) MSGS[i].spam = true;   // optimistic: leaves main page
+    // optimistic: moves into the spam bucket (leaves the primary view)
+    for(const i of targets){ MSGS[i].spam = true; MSGS[i].bucket = "spam"; }
     exitSelectMode();          // clears SELECTED, hides the select-mode buttons
-    rebuildList();             // re-filter (main view drops them; spam keeps)
+    rebuildList();             // re-filter (primary view drops them; spam keeps)
     triggerFullSync();         // pull every account so server truth catches up
   }catch(e){
     alert("Network error: " + e);
@@ -2263,6 +2313,10 @@ function clearAll(){
   ACCTS.forEach(a => acctSel.add(a));        // all accounts back on
   syncAcct();
   $("acctf").classList.remove("open");
+  bucketSel.clear();
+  bucketSel.add("primary");                  // back to primary-only default
+  syncBucket();
+  $("bucketf").classList.remove("open");
   dropSelectionOnFilterChange();
   if(thrOpen) showList();
   $("list").scrollTop = 0;
@@ -2394,7 +2448,7 @@ function openConv(focus){
   $("notspambtn").style.display = "none";
   $("markspambtn").style.display = "none";
   $("leftctl").style.display = "none";
-  $("spambtn").style.display = "none";
+  $("bucketf").style.display = "none";
   thrOpen = true;
   const fr = pos[focus];
   const fe = $("thread").querySelector(`.row[data-r="${fr}"]`);
@@ -2695,7 +2749,7 @@ function showList(){
   // Restore the Select button; re-show the action buttons only if a
   // selection was still active when we drilled into a conversation.
   $("selbtn").style.display = "";
-  $("spambtn").style.display = "";
+  $("bucketf").style.display = "";
   if(selectMode){
     $("rmbtn").style.display = "inline-block";
     $("readbtn").style.display = "inline-block";
@@ -2724,20 +2778,65 @@ function toggleCols(){
 }
 $("colstoggle").addEventListener("click", toggleCols);
 
-// Spam page: a second view of the same list, filtered to SPAM-labelled mail
-// (matches() flips on spamView). The main view hides spam. Switching pages is
-// a filter change, so it drops any in-progress selection.
-function setSpamView(on){
-  spamView = on;
-  $("spambtn").classList.toggle("on", on);
-  $("spambtn").title = on ? "Back to inbox" : "Show spam mail";
-  dropSelectionOnFilterChange();
-  if(thrOpen) showList();
-  updateSpamButtons();     // swap Not-spam / Mark-spam for the new view
-  $("list").scrollTop = 0;
-  rebuildList();
+// --- bucket (tier) filter: a multi-select dropdown in the header bar that
+// replaces the old Spam toggle. Mirrors buildAcctFilter(): 'primary' shows by
+// default, lite tiers are opt-in. Changing it is a filter change, so it drops
+// any in-progress selection (a destructive action must never touch hidden rows).
+function bucketDispLabel(){
+  const n = bucketSel.size;
+  if(n === 0) return "None";
+  if(n === BUCKETS.length) return "All mail";
+  if(n === 1) return BUCKET_LABELS[[...bucketSel][0]] || [...bucketSel][0];
+  return n + " tiers";
 }
-$("spambtn").addEventListener("click", () => setSpamView(!spamView));
+function syncBucket(){
+  const w = $("bucketf");
+  if(!w) return;
+  w.querySelector(".lbl").textContent = bucketDispLabel();
+  w.classList.toggle("active", bucketFiltered());
+  const all = $("bucket-all");
+  if(all) all.checked = bucketSel.size === BUCKETS.length;
+  w.querySelectorAll(".opt input[data-b]").forEach(cb =>
+    cb.checked = bucketSel.has(cb.dataset.b));
+}
+function buildBucketFilter(){
+  const w = $("bucketf");
+  if(!w) return;
+  const opts = BUCKETS.map(b =>
+    `<label class="opt"><input type="checkbox" data-b="${esc(b)}">`
+    + `<i class="acctdot" style="background:${BUCKET_COLOR[b]||"#8F8B80"}"></i>`
+    + `<span>${esc(BUCKET_LABELS[b] || b)}</span></label>`).join("");
+  w.innerHTML = '<div class="btn"><span class="lbl"></span>'
+    + '<span class="car">▾</span></div><div class="menu">'
+    + '<label class="opt all"><input type="checkbox" id="bucket-all">'
+    + '<i class="acctdot" style="visibility:hidden"></i>'   // align label
+    + '<span>All mail</span></label>' + opts + '</div>';
+  w.querySelector(".btn").addEventListener("click", e => {
+    e.stopPropagation();
+    w.classList.toggle("open");
+  });
+  w.querySelectorAll(".opt input").forEach(cb => {
+    cb.addEventListener("change", () => {
+      if(cb.id === "bucket-all"){
+        bucketSel.clear();
+        if(cb.checked) BUCKETS.forEach(b => bucketSel.add(b));
+      } else {
+        cb.checked ? bucketSel.add(cb.dataset.b) : bucketSel.delete(cb.dataset.b);
+      }
+      dropSelectionOnFilterChange();
+      syncBucket();
+      if(thrOpen) showList();
+      $("list").scrollTop = 0;
+      rebuildList();
+    });
+  });
+  syncBucket();
+}
+// close the bucket dropdown when clicking anywhere outside it
+document.addEventListener("click", e => {
+  const w = $("bucketf");
+  if(w && !w.contains(e.target)) w.classList.remove("open");
+});
 
 // --- Ask the graph: a chat with the knowledge graph, answered by
 // serve_app.py (graph-RAG + headless Claude Code). It keeps a conversation,
@@ -4416,6 +4515,7 @@ document.addEventListener("keydown", e => {
   if(thrOpen) moveSel(d); else moveCursor(d);
 });
 buildAcctFilter();
+buildBucketFilter();
 rebuildList();
 
 /* === live mode — active only when served by serve_app.py =============
@@ -4474,6 +4574,16 @@ function _rebuildIndices(){
 
   // Rebuild the account-filter dropdown so any new accounts are clickable.
   buildAcctFilter();
+
+  // Buckets may have grown (lite mail newly loaded). Unlike accounts, do NOT
+  // auto-select new buckets — lite stays opt-in. 'primary' is always offered;
+  // bucketSel (preserved across the swap) just drops any vanished bucket.
+  BUCKETS = [...new Set(MSGS.map(m => m.bucket).filter(Boolean))]
+    .sort((a, b) => BUCKET_ORDER.indexOf(a) - BUCKET_ORDER.indexOf(b));
+  if(!BUCKETS.includes("primary")) BUCKETS.unshift("primary");
+  for(const b of [...bucketSel]) if(!BUCKETS.includes(b)) bucketSel.delete(b);
+  if(bucketSel.size === 0) bucketSel.add("primary");
+  buildBucketFilter();
 }
 
 // Swap in a fresh payload without a full page reload. Preserves scroll
