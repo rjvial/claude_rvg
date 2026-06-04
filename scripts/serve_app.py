@@ -928,6 +928,12 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
         _ask_lock.release()
 
 
+# Reference to the live HTTP server, set in main(). The /api/shutdown endpoint
+# (the app's power button) uses it to stop the server gracefully so the page can
+# show a visible "stopping → stopped" state before the window closes.
+_srv = None
+
+
 # Disk snapshot of the last rendered page, so a cold launch can serve the real
 # app instantly while Docker/Neo4j/rebuild() run in the background (the main
 # first-launch pain point). The browser loads slightly-stale mail immediately;
@@ -1112,6 +1118,68 @@ def _fast_load_records(records: list[dict]) -> None:
     drv = graph_app.driver()
     try:
         load_neo4j.fast_load_records(records, driver=drv)
+    finally:
+        drv.close()
+
+
+def reconcile_graph() -> int:
+    """Self-heal the graph against emails.jsonl — the safety net that makes mail
+    loss impossible. A sync writes each message to emails.jsonl (a durable,
+    append-only log) and advances its Gmail cursor BEFORE the Neo4j load commits;
+    so a crash/kill/load-error in that window leaves the message in the log but
+    absent from the graph, and a normal re-sync skips it (cursor already past it,
+    id already in the pulled-tracker). This reconciliation closes that gap: it
+    compares emails.jsonl directly to the graph (NOT the trackers) and loads
+    anything missing, idempotently. Run on every boot, so any message stranded by
+    a previous session is recovered before the user looks. Returns the count
+    loaded.
+
+    The graph should already contain every non-draft line of emails.jsonl, so in
+    the healthy case this finds nothing and is a cheap no-op (one query + one
+    sequential read)."""
+    import graph_app
+    import clean_bodies
+    import load_neo4j
+    import body_store
+    ej = DATA_DIR / "emails.jsonl"
+    if not ej.exists():
+        return 0
+    drv = graph_app.driver()
+    try:
+        # Compound key (account_owner, gmail_message_id) — same as the node key.
+        present: set[tuple] = set()
+        with drv.session() as session:
+            for r in session.run("MATCH (m:Message) RETURN m.account_owner AS a, "
+                                  "m.gmail_message_id AS g"):
+                present.add((r["a"], r["g"]))
+        missing: list[dict] = []
+        seen: set[tuple] = set()
+        with ej.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if "DRAFT" in (rec.get("label_ids") or []):
+                    continue
+                # Raw log uses "message_id"; the node key is "gmail_message_id"
+                # (same value). Dedup within the log too (autosave copies etc.).
+                key = (rec.get("account_owner"), rec.get("message_id"))
+                if not key[1] or key in present or key in seen:
+                    continue
+                seen.add(key)
+                missing.append(rec)
+        if not missing:
+            return 0
+        print(f"[serve] reconcile: {len(missing)} message(s) in emails.jsonl "
+              f"missing from the graph — loading (self-heal)", flush=True)
+        clean_bodies.clean_records(missing)
+        load_neo4j.fast_load_records(missing, driver=drv)
+        body_store.refresh()
+        return len(missing)
     finally:
         drv.close()
 
@@ -2710,6 +2778,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if cid:
                 _client_disconnected(cid)
             self._send(204, b"", "text/plain")
+        elif p == "/api/shutdown":
+            # The app's power button: stop the server now (gracefully) so the
+            # page can show a visible "stopping → stopped" state. Reply first,
+            # then shut down on a short delay so this response flushes first.
+            self._send(200, json.dumps({"ok": True}), "application/json")
+
+            def _stop():
+                time.sleep(0.4)
+                if _srv is not None:
+                    _srv.shutdown()
+            threading.Thread(target=_stop, daemon=True).start()
         elif p == "/api/sync/hold":
             # Client heartbeat: {"seconds": N} extends the auto-sync hold to
             # max(current, now+N). seconds=0 (or missing) clears the hold.
@@ -2976,10 +3055,16 @@ _APP_WINDOW_SIZE = "1255,832"
 
 
 def _open_app_window(url: str) -> None:
-    """Open the app in a Chromium 'app' window — a standalone window with no
-    address bar or tabs, like an installed PWA — using the user's normal Chrome
-    profile (so their prompt history, settings and translate prefs carry over).
-    Falls back to the default browser if no Chromium is found."""
+    """Open the app in a Chromium kiosk window — fullscreen, no title bar and no
+    window controls (no ✕), so the in-app ⏻ power button is the only way to
+    close it. Falls back to the default browser if no Chromium is found.
+
+    A DEDICATED profile dir (--user-data-dir) is required: if we reused the
+    user's normal Chrome, then whenever their main Chrome is already running our
+    launch would just hand the URL to that instance, which IGNORES --kiosk and
+    opens a framed window (the ✕ reappears). A separate profile forces our own
+    Chrome instance, so --kiosk actually applies. The profile persists under
+    %LOCALAPPDATA%\\MailGraph so app state (history, etc.) carries across launches."""
     import os
     rels = (r"Google\Chrome\Application\chrome.exe",
             r"Microsoft\Edge\Application\msedge.exe")
@@ -2988,11 +3073,20 @@ def _open_app_window(url: str) -> None:
              os.environ.get("LOCALAPPDATA", "")]
     cands = [os.path.join(b, r) for b in bases if b for r in rels]
     cands += [shutil.which("chrome"), shutil.which("msedge")]
+    profile = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                           "MailGraph", "chrome-profile")
     for exe in cands:
         if exe and os.path.exists(exe):
             try:
-                subprocess.Popen([exe, f"--app={url}",
-                                  f"--window-size={_APP_WINDOW_SIZE}"])
+                # --kiosk = fullscreen, no chrome/title bar/✕. --app keeps it a
+                # single standalone window. --user-data-dir forces our OWN
+                # instance so --kiosk is honored even if Chrome is already open.
+                # --no-first-run/--no-default-browser-check suppress the new
+                # profile's welcome prompts (which would otherwise block kiosk).
+                subprocess.Popen([exe, "--kiosk", f"--app={url}",
+                                  f"--user-data-dir={profile}",
+                                  "--no-first-run",
+                                  "--no-default-browser-check"])
                 return
             except OSError:
                 continue
@@ -3144,7 +3238,7 @@ def _boot_sequence() -> None:
                 _set_boot(phase="Neo4j unavailable", error=msg, running=False)
                 _notify_dialog(msg)
                 return
-        _set_boot(phase="Loading graph from Neo4j…", error="")
+        _set_boot(phase="Loading graph…", error="")
         # Even once the store answers a probe, the database can briefly report
         # DatabaseUnavailable while it finishes coming online after a cold
         # start. Retry the graph load a few times before surfacing an error.
@@ -3161,10 +3255,28 @@ def _boot_sequence() -> None:
         threading.Thread(target=sync_loop, args=(_sync_interval,),
                          daemon=True).start()
         threading.Thread(target=build_style_profiles, daemon=True).start()
+        # Self-heal: recover any mail stranded by an interrupted previous-session
+        # sync (in emails.jsonl but never loaded). Background so it never delays
+        # startup; rebuilds the page if it recovered anything so the window's
+        # reload banner offers the now-complete graph.
+        threading.Thread(target=_reconcile_on_boot, daemon=True).start()
         _set_boot(phase="Ready", ready=True, running=False)
     except Exception as e:
         _set_boot(phase="Startup failed", error=_safe_err("boot", e),
                   running=False)
+
+
+def _reconcile_on_boot() -> None:
+    """Run reconcile_graph() once at startup and rebuild the page cache if it
+    recovered anything. Best-effort — a failure here must never break boot."""
+    try:
+        n = reconcile_graph()
+        if n:
+            print(f"[serve] reconcile recovered {n} message(s); rebuilding",
+                  flush=True)
+            rebuild()
+    except Exception as e:
+        print(f"[serve] reconcile skipped: {type(e).__name__}: {e}", flush=True)
 
 
 def _start_boot() -> None:
@@ -3320,6 +3432,8 @@ def main() -> int:
         open_ui()
         return 0
     srv.daemon_threads = True
+    global _srv
+    _srv = srv                    # let /api/shutdown (the power button) stop us
 
     # Show the loading splash and open the window immediately; the slow work
     # (start Neo4j → load the graph → build the cache) runs in a background

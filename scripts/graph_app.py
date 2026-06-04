@@ -717,6 +717,8 @@ PAGE = r"""<!DOCTYPE html>
   .askhd .asknew:hover{border-color:var(--accent);color:var(--accent-deep)}
   .askhd .x{cursor:pointer;color:var(--ink-3);font-size:16px}
   .askhd .x:hover{color:var(--accent-deep)}
+  /* Settings has no .winctl wrapper — push its lone close ✕ to the far right. */
+  #acctsx{margin-left:auto}
   /* chat transcript */
   #asklog{flex:1;min-height:80px;overflow-y:auto;padding:14px 16px;
     display:flex;flex-direction:column;gap:9px}
@@ -1060,6 +1062,60 @@ PAGE = r"""<!DOCTYPE html>
   .cdrop .opt:hover,.cdrop .opt.on{background:var(--tint)}
   .cdrop .nm{color:var(--ink)}
   .cdrop .em{color:var(--ink-3);font-size:11px}
+  /* account color picker — a small in-app popup (so it can carry its own ✕,
+     unlike the native OS color dialog). Anchored near the click point. */
+  #clrpop{display:none;position:fixed;z-index:50;width:204px;
+    background:var(--bg);border:1px solid var(--line-2);border-radius:10px;
+    box-shadow:0 14px 40px rgba(40,32,24,.28);overflow:hidden}
+  #clrpop .clrhd{display:flex;align-items:center;padding:9px 12px;
+    font:500 13px/1.3 var(--serif);color:var(--ink);
+    border-bottom:1px solid var(--line)}
+  #clrpop .clrhd .ttl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #clrpop .clrhd .x{margin-left:auto;padding-left:10px;cursor:pointer;
+    color:var(--ink-3);font-size:16px}
+  #clrpop .clrhd .x:hover{color:var(--accent-deep)}
+  #clrpop .clrbody{padding:11px 12px}
+  #clrpop .sw{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}
+  #clrpop .sw i{width:22px;height:22px;border-radius:50%;cursor:pointer;
+    box-shadow:0 0 0 1px var(--line) inset;border:2px solid transparent}
+  #clrpop .sw i:hover{border-color:var(--accent)}
+  #clrpop .sw i.on{border-color:var(--accent-deep)}
+  #clrpop .custom{margin-top:11px;display:flex;align-items:center;gap:8px;
+    font-size:12px;color:var(--ink-3)}
+  #clrpop .custom input[type=color]{width:36px;height:24px;padding:0;
+    border:1px solid var(--line-2);border-radius:6px;background:var(--raised);
+    cursor:pointer}
+  /* mail-server status pill — shows the server starting / running / closing */
+  #hdr .srvpill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;
+    border-radius:20px;font-size:11.5px;font-weight:600;white-space:nowrap;
+    border:1px solid var(--line-2);background:var(--surface);color:var(--ink-2)}
+  #hdr .srvpill i{width:8px;height:8px;border-radius:50%;background:var(--ink-3);
+    flex-shrink:0}
+  #hdr .srvpill.running{color:#2E7D45;border-color:#bfe0cb}
+  #hdr .srvpill.running i{background:#2E9D58}
+  #hdr .srvpill.starting{color:#9A6B27;border-color:#e8d3b0}
+  #hdr .srvpill.starting i{background:#E0A458;animation:srvpulse 1s infinite}
+  #hdr .srvpill.closing,#hdr .srvpill.stopped{color:#A84A43;border-color:#e3bdb8}
+  #hdr .srvpill.closing i{background:#C25C54;animation:srvpulse 1s infinite}
+  #hdr .srvpill.stopped i{background:#C25C54}
+  @keyframes srvpulse{0%,100%{opacity:1}50%{opacity:.3}}
+  /* power button — closes the app, but stops the server first (see #quitveil) */
+  #hdr #powerbtn{background:var(--surface);color:var(--ink-2);
+    border:1px solid var(--line-2);font-size:15px;line-height:1;padding:5px 9px}
+  #hdr #powerbtn:hover{background:#F3E0DB;border-color:#C25C54;color:#A84A43}
+  /* full-screen "stopping the server" veil — mirrors the loading splash */
+  #quitveil{display:none;position:fixed;inset:0;z-index:60;background:var(--bg);
+    align-items:center;justify-content:center}
+  #quitveil.on{display:flex}
+  #quitveil .qcard{width:min(420px,90vw);text-align:center;padding:34px 30px}
+  #quitveil .qlogo{width:76px;height:76px;margin:0 auto 22px;display:block;
+    border-radius:18px;box-shadow:0 10px 26px rgba(204,120,92,.28)}
+  #quitveil .qmsg{font:600 18px/1.35 var(--serif);color:var(--ink)}
+  #quitveil .qbar{margin:22px auto 0;width:100%;height:4px;border-radius:3px;
+    background:var(--line);overflow:hidden}
+  #quitveil .qbar>i{display:block;height:100%;width:35%;border-radius:3px;
+    background:var(--accent);animation:slideq 1.1s ease-in-out infinite}
+  @keyframes slideq{0%{margin-left:-35%}100%{margin-left:100%}}
 </style></head><body class="cols-hidden">
 <div id="hdr">
   <div id="leftctl">
@@ -1090,8 +1146,18 @@ PAGE = r"""<!DOCTYPE html>
   <div class="acctf bucketf" id="bucketf"
     title="Filter by mail bucket (primary vs promotions/social/updates/forums/spam)"></div>
   <button id="acctsbtn" title="Settings: email accounts, LLM model, Claude sign-in">⚙ Settings</button>
+  <span id="srvpill" class="srvpill starting" title="Mail server status">
+    <i></i><span id="srvpilltxt">Starting…</span></span>
+  <button id="powerbtn" title="Close the app — stops the mail server first">⏻</button>
 </div>
 <div id="banner">↻ New mail synced — click to reload</div>
+<div id="quitveil">
+  <div class="qcard">
+    <img class="qlogo" src="/icon.svg" alt="">
+    <div class="qmsg" id="quitmsg">Stopping the mail server…</div>
+    <div class="qbar" id="quitbar"><i></i></div>
+  </div>
+</div>
 <div id="accts">
   <div class="askcard">
     <div class="askhd">⚙ Settings
@@ -1182,6 +1248,15 @@ PAGE = r"""<!DOCTYPE html>
 <div id="list"><div id="spacer"></div></div>
 <div id="thread"></div>
 <aside id="panel"></aside>
+<div id="clrpop">
+  <div class="clrhd"><span class="ttl" id="clrttl">Account color</span>
+    <span class="x" id="clrx" title="Close">✕</span></div>
+  <div class="clrbody">
+    <div class="sw" id="clrsw"></div>
+    <label class="custom">Custom
+      <input type="color" id="clrcustom"></label>
+  </div>
+</div>
 <div id="compose">
   <div class="ccard">
     <div class="chd"><span id="ctitle">New message</span>
@@ -1319,17 +1394,22 @@ const ACCT_COLOR = {
 const ACCT_PAL = ["#3F9A74","#C0863C","#5670B4","#A368B8","#C25C54"];
 MSGS.forEach(m => { if(m.acct && !(m.acct in ACCT_COLOR))
   ACCT_COLOR[m.acct] = ACCT_PAL[Object.keys(ACCT_COLOR).length % ACCT_PAL.length]; });
+// User-chosen per-account dot colors (set by right-clicking an account in the
+// filter dropdown). Persisted in localStorage so they survive reloads; applied
+// on top of the defaults/palette above.
+const ACCT_COLOR_KEY = "acctColors";
+function loadAcctColorOverrides(){
+  try{ return JSON.parse(localStorage.getItem(ACCT_COLOR_KEY) || "{}") || {}; }
+  catch(e){ return {}; }
+}
+function applyAcctColorOverrides(){
+  const ov = loadAcctColorOverrides();
+  for(const a in ov) ACCT_COLOR[a] = ov[a];
+}
+applyAcctColorOverrides();
 
-// Per-bucket (treatment-tier) dot colors + canonical display order. 'primary'
-// is real correspondence; the rest are lite tiers. See _common.message_bucket.
-const BUCKET_COLOR = {
-  primary:    "#2E9D58",   // green  — full treatment
-  promotions: "#E0A458",   // amber
-  social:     "#6F86D6",   // indigo
-  updates:    "#56C596",   // teal
-  forums:     "#C98BDB",   // purple
-  spam:       "#C25C54",   // red
-};
+// Canonical display order for the treatment tiers. 'primary' is real
+// correspondence; the rest are lite tiers. See _common.message_bucket.
 const BUCKET_ORDER = ["primary","promotions","social","updates","forums","spam"];
 const BUCKET_LABELS = {
   primary:"Primary", promotions:"Promotions", social:"Social",
@@ -1707,14 +1787,16 @@ function msgRowHTML(m, cell, gi){
   const fromTip = m.from ? esc(m.from) + " — right-click to copy" : "";
   const toTip   = toEmails ? esc(toEmails) + " — right-click to copy" : "";
   return `<span class="c-sel"><input type="checkbox" data-i="${gi}"${checked}></span>`
-    + `<span class="c-acct lacct"><i class="acctdot" style="background:`
+    + `<span class="c-acct lacct" data-acct="${esc(m.acct)}" `
+    + `title="Right-click to change this account's color">`
+    + `<i class="acctdot" style="background:`
     + `${ACCT_COLOR[m.acct]||"#8F8B80"}"></i>${cell("acct", m.acct)}</span>`
     + `<span class="c-date ldate">${cell("date", dstr(m.sent))}</span>`
     + `<span class="c-from lfrom" title="${fromTip}" `
     + `data-email="${esc(m.from)}">${cell("from", who(m))}</span>`
     + `<span class="c-to lfrom" title="${toTip}" `
     + `data-email="${esc(toEmails)}">${cell("to", toLabel(m.to))}</span>`
-    + `<span class="c-subj lsubj">${cell("subj", m.subj)}</span>`
+    + `<span class="c-subj lsubj" title="${esc(m.subj)}">${cell("subj", m.subj)}</span>`
     + `<span class="c-snip lsnip">${cell("snip", m.snip)}</span>`
     + `<span class="c-att">${(m.atts.length || m.inline_img) ? "Yes" : "No"}</span>`
     + `<span class="c-pos lpos">${CONVPOS[gi]} / ${CONV[m.conv].length}</span>`;
@@ -1794,6 +1876,12 @@ $("spacer").addEventListener("click", e => {
 // of opening the browser's context menu. Delegated on #spacer so it survives
 // the row pool's innerHTML swaps.
 $("spacer").addEventListener("contextmenu", e => {
+  // Right-click an account cell → pick that account's dot color.
+  const acctCell = e.target.closest(".c-acct[data-acct]");
+  if(acctCell){
+    const a = (acctCell.dataset.acct || "").trim();
+    if(a){ e.preventDefault(); pickAcctColor(a, e.clientX, e.clientY); return; }
+  }
   const cell = e.target.closest(".c-from[data-email], .c-to[data-email]");
   if(!cell) return;
   const email = (cell.dataset.email || "").trim();
@@ -2262,7 +2350,7 @@ function syncAcct(){
 function buildAcctFilter(){
   const w = $("acctf");
   const opts = ACCTS.map(a =>
-    `<label class="opt"><input type="checkbox" data-a="${esc(a)}">`
+    `<label class="opt" title="Right-click to change color"><input type="checkbox" data-a="${esc(a)}">`
     + `<i class="acctdot" style="background:${ACCT_COLOR[a]||"#8F8B80"}"></i>`
     + `<span>${esc(a)}</span></label>`).join("");
   w.innerHTML = '<div class="btn"><span class="lbl"></span>'
@@ -2289,7 +2377,67 @@ function buildAcctFilter(){
       rebuildList();
     });
   });
+  // Right-click an account row to pick its dot color (persisted in localStorage).
+  w.querySelectorAll(".opt input[data-a]").forEach(cb => {
+    cb.closest(".opt").addEventListener("contextmenu", e => {
+      e.preventDefault();
+      pickAcctColor(cb.dataset.a, e.clientX, e.clientY);
+    });
+  });
   syncAcct();
+}
+// Swatches offered in the account color popup. The first few echo the default
+// account hues; the rest are distinct, useful colors. "Custom" handles anything.
+const CLR_PRESETS = ["#2E9D58","#1E7BD8","#FF7A00","#C25C54","#A368B8","#56C596",
+  "#E0A458","#6F86D6","#C98BDB","#3F9A74","#B07D2B","#8F8B80"];
+let _clrAcct = null;
+// Open the in-app color popup for one account near (x,y). A swatch or the custom
+// picker persists the color + recolors everywhere; the ✕ / outside-click closes.
+// In-app (not the native OS dialog) so it can carry its own close button.
+function pickAcctColor(a, x, y){
+  _clrAcct = a;
+  const cur = (ACCT_COLOR[a] || "#8F8B80").toLowerCase();
+  $("clrttl").textContent = a;
+  $("clrttl").title = a;
+  $("clrsw").innerHTML = CLR_PRESETS.map(c =>
+    `<i data-c="${c}" title="${esc(c)}"${c.toLowerCase() === cur ? ' class="on"' : ''}`
+    + ` style="background:${c}"></i>`).join("");
+  $("clrcustom").value = /^#[0-9a-f]{6}$/i.test(cur) ? cur : "#8f8b80";
+  const pop = $("clrpop");
+  pop.style.display = "block";
+  // Position at the click, clamped to stay fully on-screen.
+  const pw = pop.offsetWidth || 204, ph = pop.offsetHeight || 170;
+  const px = Math.min(x == null ? 80 : x, window.innerWidth  - pw - 8);
+  const py = Math.min(y == null ? 80 : y, window.innerHeight - ph - 8);
+  pop.style.left = Math.max(8, px) + "px";
+  pop.style.top  = Math.max(8, py) + "px";
+}
+function closeClrPop(){ $("clrpop").style.display = "none"; _clrAcct = null; }
+$("clrx").addEventListener("click", closeClrPop);
+$("clrsw").addEventListener("click", e => {
+  const sw = e.target.closest("i[data-c]");
+  if(!sw || !_clrAcct) return;
+  setAcctColor(_clrAcct, sw.dataset.c);
+  closeClrPop();
+});
+$("clrcustom").addEventListener("change", e => {
+  if(_clrAcct) setAcctColor(_clrAcct, e.target.value);
+  closeClrPop();
+});
+// Outside-click closes the popup (right-click opens it, so a stray left-click
+// elsewhere dismisses it). The popup itself is excluded.
+document.addEventListener("click", e => {
+  const pop = $("clrpop");
+  if(pop.style.display === "block" && !pop.contains(e.target)) closeClrPop();
+});
+function setAcctColor(a, color){
+  const ov = loadAcctColorOverrides();
+  ov[a] = color;
+  try{ localStorage.setItem(ACCT_COLOR_KEY, JSON.stringify(ov)); }catch(e){}
+  ACCT_COLOR[a] = color;
+  buildAcctFilter();    // refresh the dropdown dot
+  rebuildList();        // refresh the per-row dots
+  if(thrOpen) showList();
 }
 // close the dropdown when clicking anywhere outside it
 document.addEventListener("click", e => {
@@ -2613,6 +2761,9 @@ function popoutPanel(i){
     .reembed{float:right;cursor:pointer;color:#5F5B53;font-size:11.5px;
       background:#FFFEFB;border:1px solid #D6D2C4;border-radius:6px;padding:3px 10px}
     .reembed:hover{border-color:#CC785C;color:#B05E40}
+    .closew{float:right;cursor:pointer;color:#8F8B80;font-size:18px;line-height:1;
+      margin-left:12px}
+    .closew:hover{color:#B05E40}
     .pnum{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;
       border-radius:10px;background:#FFFEFB;border:1px solid #D6D2C4;color:#5F5B53}
     h2{font:500 16px/1.35 Georgia,"Times New Roman",serif;color:#141413;margin:9px 0 4px}
@@ -2638,6 +2789,10 @@ function popoutPanel(i){
   // Inline onclicks call back into the main window. Guard against the
   // opener being closed/navigated-away — clicking just becomes a no-op.
   const op = "window.opener && !window.opener.closed";
+  // Close button (top-right) + Re-embed. Both float right; the close ✕ comes
+  // first in the DOM so it lands in the far-right corner.
+  const closeBtn = `<span class="closew" title="Close window" `
+    + `onclick="window.close()">✕</span>`;
   const reembedBtn = `<span class="reembed" `
     + `title="Move this message back to the right pane" `
     + `onclick="if(${op}) window.opener.reembedFromPopout()">↙ Re-embed</span>`;
@@ -2657,6 +2812,7 @@ function popoutPanel(i){
   const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">`
     + `<title>${esc(m.subj || "(no subject)")}</title><style>${styles}</style>`
     + `</head><body>`
+    + closeBtn
     + reembedBtn
     + panelInnerHTML(m, num, parNum)
     + actions
@@ -2804,7 +2960,7 @@ function buildBucketFilter(){
   if(!w) return;
   const opts = BUCKETS.map(b =>
     `<label class="opt"><input type="checkbox" data-b="${esc(b)}">`
-    + `<i class="acctdot" style="background:${BUCKET_COLOR[b]||"#8F8B80"}"></i>`
+    + `<i class="acctdot" style="visibility:hidden"></i>`   // no per-category color
     + `<span>${esc(BUCKET_LABELS[b] || b)}</span></label>`).join("");
   w.innerHTML = '<div class="btn"><span class="lbl"></span>'
     + '<span class="car">▾</span></div><div class="menu">'
@@ -3227,6 +3383,63 @@ function openAccts(){
   loadMemory();
 }
 function closeAccts(){ $("accts").style.display = "none"; stopClaudePoll(); }
+
+// ---- mail-server status pill + power button ---------------------------------
+// The pill shows the server's state in the header ribbon: starting → running.
+// The power button (⏻) closes the app, but first stops the server and waits
+// until it's confirmed stopped (shown on a full-screen veil) before the window
+// closes — so you always see the shutdown happen.
+let _quitting = false;
+function setSrvPill(state, text){
+  const p = $("srvpill");
+  if(!p) return;
+  p.className = "srvpill " + state;
+  $("srvpilltxt").textContent = text;
+}
+async function pollSrvStatus(){
+  if(_quitting) return;
+  try{
+    const d = await (await fetch("api/boot", {cache: "no-store"})).json();
+    if(d.ready){ setSrvPill("running", "Server running"); return; }
+    setSrvPill("starting", d.phase || "Starting…");
+  }catch(e){
+    setSrvPill("starting", "Starting…");
+  }
+  setTimeout(pollSrvStatus, 800);
+}
+async function powerOff(){
+  if(_quitting) return;
+  _quitting = true;
+  setSrvPill("closing", "Stopping…");
+  $("quitmsg").textContent = "Stopping the mail server…";
+  $("quitbar").style.display = "block";
+  $("quitveil").classList.add("on");
+  try{ await fetch("api/shutdown", {method: "POST"}); }catch(e){}
+  // Wait until the server stops answering, THEN show stopped and close.
+  const t0 = Date.now();
+  (function waitGone(){
+    fetch("api/version", {cache: "no-store"})
+      .then(() => { if(Date.now() - t0 > 20000) serverStopped();
+                    else setTimeout(waitGone, 400); })
+      .catch(() => serverStopped());
+  })();
+}
+function serverStopped(){
+  setSrvPill("stopped", "Server stopped");
+  $("quitbar").style.display = "none";
+  $("quitmsg").textContent = "Server stopped. Closing…";
+  // Give the user a moment to see "stopped", then close the kiosk window.
+  setTimeout(() => {
+    window.close();
+    // If the browser blocks window.close() (kiosk has no ✕), tell the user the
+    // always-works fallback. Alt+F4 closes the focused window on Windows.
+    setTimeout(() => {
+      $("quitmsg").textContent = "Server stopped. Press Alt+F4 to close.";
+    }, 600);
+  }, 1300);
+}
+$("powerbtn").addEventListener("click", powerOff);
+pollSrvStatus();
 
 async function renderAccts(){
   const box = $("acctlist");
@@ -4537,6 +4750,7 @@ function _rebuildIndices(){
   PEOPLE = DATA.people;
   MSGS.forEach(m => { if(m.acct && !(m.acct in ACCT_COLOR))
     ACCT_COLOR[m.acct] = ACCT_PAL[Object.keys(ACCT_COLOR).length % ACCT_PAL.length]; });
+  applyAcctColorOverrides();   // re-apply user-chosen colors over any new defaults
 
   // CONV is a const object — mutate in place so existing closures keep the
   // same reference.
