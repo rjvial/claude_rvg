@@ -3055,16 +3055,16 @@ _APP_WINDOW_SIZE = "1255,832"
 
 
 def _open_app_window(url: str) -> None:
-    """Open the app in a Chromium kiosk window — fullscreen, no title bar and no
-    window controls (no ✕), so the in-app ⏻ power button is the only way to
-    close it. Falls back to the default browser if no Chromium is found.
+    """Open the app in a Chromium 'app' window — a standalone window (no address
+    bar or tabs) at a fixed size (_APP_WINDOW_SIZE). Falls back to the default
+    browser if no Chromium is found.
 
-    A DEDICATED profile dir (--user-data-dir) is required: if we reused the
-    user's normal Chrome, then whenever their main Chrome is already running our
-    launch would just hand the URL to that instance, which IGNORES --kiosk and
-    opens a framed window (the ✕ reappears). A separate profile forces our own
-    Chrome instance, so --kiosk actually applies. The profile persists under
-    %LOCALAPPDATA%\\MailGraph so app state (history, etc.) carries across launches."""
+    A DEDICATED profile dir (--user-data-dir) is used so we always launch our
+    OWN Chrome instance: if we reused the user's normal Chrome, then whenever
+    their main Chrome was already running our launch would just hand the URL to
+    that instance and IGNORE --window-size (and --app sizing). A separate
+    instance honors the flags. The profile persists under %LOCALAPPDATA%\\MailGraph
+    so app state (history, etc.) carries across launches."""
     import os
     rels = (r"Google\Chrome\Application\chrome.exe",
             r"Microsoft\Edge\Application\msedge.exe")
@@ -3078,12 +3078,13 @@ def _open_app_window(url: str) -> None:
     for exe in cands:
         if exe and os.path.exists(exe):
             try:
-                # --kiosk = fullscreen, no chrome/title bar/✕. --app keeps it a
-                # single standalone window. --user-data-dir forces our OWN
-                # instance so --kiosk is honored even if Chrome is already open.
-                # --no-first-run/--no-default-browser-check suppress the new
-                # profile's welcome prompts (which would otherwise block kiosk).
-                subprocess.Popen([exe, "--kiosk", f"--app={url}",
+                # --app = single standalone window. --window-size restores the
+                # previous fixed size. --user-data-dir forces our OWN instance
+                # so the size is honored even if Chrome is already open.
+                # --no-first-run/--no-default-browser-check suppress the fresh
+                # profile's welcome prompts.
+                subprocess.Popen([exe, f"--app={url}",
+                                  f"--window-size={_APP_WINDOW_SIZE}",
                                   f"--user-data-dir={profile}",
                                   "--no-first-run",
                                   "--no-default-browser-check"])

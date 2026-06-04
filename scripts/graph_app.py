@@ -3431,10 +3431,9 @@ function serverStopped(){
   // Give the user a moment to see "stopped", then close the kiosk window.
   setTimeout(() => {
     window.close();
-    // If the browser blocks window.close() (kiosk has no ✕), tell the user the
-    // always-works fallback. Alt+F4 closes the focused window on Windows.
+    // If the browser blocks window.close(), the title-bar ✕ is available.
     setTimeout(() => {
-      $("quitmsg").textContent = "Server stopped. Press Alt+F4 to close.";
+      $("quitmsg").textContent = "Server stopped. You can close this window.";
     }, 600);
   }, 1300);
 }
