@@ -31,7 +31,7 @@ import json
 from tqdm import tqdm
 
 from _attachments import is_real_attachment
-from _common import DATA_DIR, is_excluded_category, neo4j_driver
+from _common import DATA_DIR, message_bucket, neo4j_driver
 
 EMAILS_CLEAN_JSONL = DATA_DIR / "emails_clean.jsonl"
 ORGS_SEED_PATH = DATA_DIR / "orgs_seed.json"
@@ -74,6 +74,9 @@ CONSTRAINTS = [
     # Attachments are per-message, keyed by MIME part_id (stable per re-fetch).
     "CREATE CONSTRAINT attachment_key  IF NOT EXISTS FOR (a:Attachment) REQUIRE (a.gmail_message_id, a.account_owner, a.part_id) IS UNIQUE",
     "CREATE INDEX message_sent_at    IF NOT EXISTS FOR (m:Message) ON (m.sent_at)",
+    # Treatment tier (primary vs lite buckets). Lets embed/cluster/retrieval
+    # filter to bucket='primary' cheaply, and the app browse by bucket.
+    "CREATE INDEX message_bucket     IF NOT EXISTS FOR (m:Message) ON (m.bucket)",
     "CREATE INDEX thread_started_at  IF NOT EXISTS FOR (t:Thread)  ON (t.started_at)",
     "CREATE INDEX attachment_filename IF NOT EXISTS FOR (a:Attachment) ON (a.filename)",
     # RFC-822 Message-ID is globally unique by spec; an index lets us look up
@@ -139,6 +142,7 @@ MERGE (m:Message {gmail_message_id: row.message_id, account_owner: row.account_o
     m.body_clean = row.body_clean,
     m.has_attachments = row.has_attachments,
     m.label_ids = row.label_ids,
+    m.bucket = row.bucket,
     m.gmail_url = row.gmail_url,
     m.rfc822_message_id = row.rfc822_message_id,
     m.in_reply_to = row.in_reply_to,
@@ -147,6 +151,10 @@ MERGE (m:Message {gmail_message_id: row.message_id, account_owner: row.account_o
     // gmail_url is derived from ids; always refresh to the latest form
     // (e.g. promote thread-anchored URLs to per-message rfc822msgid: URLs
     // once the backfill populates rfc822_message_id).
+    // NB: m.label_ids and m.bucket are intentionally NOT refreshed here — the
+    // live read/spam state is maintained on existing nodes by sync_incremental
+    // (apply_read_changes / apply_spam_changes), and a stale jsonl row must not
+    // clobber it. bucket is set ON CREATE; legacy nodes are backfilled once.
     m.gmail_url = row.gmail_url,
     m.rfc822_message_id = coalesce(m.rfc822_message_id, row.rfc822_message_id),
     m.in_reply_to = coalesce(m.in_reply_to, row.in_reply_to),
@@ -203,6 +211,7 @@ def msg_row(rec: dict) -> dict:
         "body_clean": rec.get("body_clean") or "",
         "has_attachments": real_atts,
         "label_ids": rec.get("label_ids") or [],
+        "bucket": message_bucket(rec.get("label_ids")),
         "gmail_url": rec.get("gmail_url"),
         "rfc822_message_id": rec.get("rfc822_message_id"),
         "in_reply_to": rec.get("in_reply_to"),
@@ -263,21 +272,17 @@ def load_messages(driver, batch: int) -> None:
     msg_batch: list[dict] = []
     recv_batch: list[dict] = []
     att_batch: list[dict] = []
-    skipped_cat = 0
 
     with driver.session() as session, \
             EMAILS_CLEAN_JSONL.open(encoding="utf-8") as fin, \
             tqdm(total=total, desc="messages") as bar:
         for line in fin:
             rec = json.loads(line)
-            # Authoritative gate: never load promo/social/updates/forums mail
-            # (spam exempt). The jsonl may still contain such rows — pulled
-            # before this filter existed, or left in the raw archive — but the
-            # graph stays category-free regardless. See _common.EXCLUDED_*.
-            if is_excluded_category(rec.get("label_ids")):
-                skipped_cat += 1
-                bar.update(1)
-                continue
+            # Promo/social/updates/forums mail is loaded like everything else —
+            # msg_row() tags it with m.bucket (lite tier). The embed/cluster/
+            # retrieval steps skip non-'primary' buckets, so the graph carries
+            # the mail without giving it the full treatment. (Spam is loaded the
+            # same way and tagged bucket='spam'.)
             msg_batch.append(msg_row(rec))
             recv_batch.extend(recipient_rows(rec))
             att_batch.extend(attachment_rows(rec))
@@ -298,8 +303,6 @@ def load_messages(driver, batch: int) -> None:
             if att_batch:
                 session.run(LOAD_ATTACHMENTS_CYPHER, rows=att_batch)
             bar.update(len(msg_batch))
-    if skipped_cat:
-        print(f"  Skipped {skipped_cat} promo/social/updates/forums message(s).")
 
 
 # ---------------------------------------------------------------------------
@@ -422,12 +425,8 @@ def fast_load_records(records: list[dict], driver=None) -> None:
     serve_app)."""
     if not records:
         return
-    # Same authoritative gate as load_messages: drop promo/social/updates/forums
-    # (spam exempt) so the incremental path can't reintroduce what the full load
-    # excludes. The sync already filters these upstream; this is belt-and-braces.
-    records = [r for r in records if not is_excluded_category(r.get("label_ids"))]
-    if not records:
-        return
+    # Categorized mail is kept (lite tier) and tagged by msg_row() -> m.bucket,
+    # same as the full load; no category drop here anymore.
     own = driver is None
     drv = driver or neo4j_driver()
     try:

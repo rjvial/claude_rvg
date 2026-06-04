@@ -161,7 +161,12 @@ class UnionFind:
 
 FETCH_THREADS_CYPHER = """
 MATCH (t:Thread)
-OPTIONAL MATCH (m:Message)-[:IN_THREAD]->(t)
+// Only 'primary' messages drive clustering. A thread with no primary message
+// (e.g. a lone promotional newsletter) is excluded entirely — otherwise
+// newsletters that share a subject would unify into bogus Matters. coalesce
+// treats legacy unbucketed nodes as primary. See _common.message_bucket.
+MATCH (m:Message)-[:IN_THREAD]->(t)
+WHERE coalesce(m.bucket, 'primary') = 'primary'
 OPTIONAL MATCH (sender:Person)-[:SENT]->(m)
 OPTIONAL MATCH (m)-[:RECEIVED_BY]->(rcpt:Person)
 WITH t,

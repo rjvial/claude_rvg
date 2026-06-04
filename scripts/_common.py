@@ -57,11 +57,50 @@ EXCLUDED_CATEGORY_LABELS = frozenset(
 
 def is_excluded_category(label_ids) -> bool:
     """True if a message should be dropped for being promo/social/updates/forums.
-    Spam is exempt — it's kept for the Spam page even when also categorized."""
+    Spam is exempt — it's kept for the Spam page even when also categorized.
+
+    Kept for reference; the load/sync paths no longer DROP categorized mail —
+    they tag it with message_bucket() and give it the "lite" treatment instead.
+    pull_gmail still uses EXCLUDED_CATEGORIES to keep the full-history backfill
+    category-free (categorized mail is pulled separately, bounded)."""
     labels = label_ids or []
     if "SPAM" in labels:
         return False
     return bool(EXCLUDED_CATEGORY_LABELS.intersection(labels))
+
+
+# Gmail auto-category label_id -> bucket name. A Message's `bucket` decides its
+# treatment tier: 'primary' gets the full pipeline (embedding, semantic
+# graph-RAG retrieval, Matter clustering); every other bucket is "lite" —
+# loaded as nodes (browsable + keyword-searchable via the full-text index) but
+# never embedded, retrieved semantically, or clustered. Single source of truth
+# for the bucket name <-> Gmail label mapping; load_neo4j and sync_incremental
+# both derive from it.
+CATEGORY_BUCKET = {
+    "CATEGORY_PROMOTIONS": "promotions",
+    "CATEGORY_SOCIAL": "social",
+    "CATEGORY_UPDATES": "updates",
+    "CATEGORY_FORUMS": "forums",
+}
+# The lite tiers (everything that isn't 'primary'). Used by downstream filters.
+LITE_BUCKETS = frozenset(CATEGORY_BUCKET.values()) | {"spam"}
+
+
+def message_bucket(label_ids) -> str:
+    """The treatment tier for a message, derived from its Gmail labels.
+
+    Returns 'primary' (full pipeline) or a lite bucket name
+    ('spam' / 'promotions' / 'social' / 'updates' / 'forums'). Spam wins over a
+    category label (a message can carry both), mirroring is_excluded_category's
+    spam-first rule; among categories the precedence is promotions > social >
+    updates > forums, though a message rarely carries two."""
+    labels = set(label_ids or [])
+    if "SPAM" in labels:
+        return "spam"
+    for label, bucket in CATEGORY_BUCKET.items():
+        if label in labels:
+            return bucket
+    return "primary"
 
 
 def valid_account_label(label: str) -> bool:

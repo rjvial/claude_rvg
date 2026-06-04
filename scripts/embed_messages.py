@@ -76,7 +76,12 @@ def hf_offline_if_cached() -> None:
 # header. Embedding them makes who/when first-class search signal.
 FETCH_CYPHER = """
 MATCH (m:Message)
-WHERE $reembed OR m.embedding IS NULL
+WHERE ($reembed OR m.embedding IS NULL)
+  // Only 'primary' mail is embedded. Lite buckets (promo/social/updates/
+  // forums/spam) are deliberately kept out of the vector index so they never
+  // surface in semantic graph-RAG retrieval. coalesce treats legacy
+  // unbucketed nodes as primary. See _common.message_bucket.
+  AND coalesce(m.bucket, 'primary') = 'primary'
 CALL (m) {
   OPTIONAL MATCH (m)-[:HAS_ATTACHMENT]->(a:Attachment)
   RETURN collect(DISTINCT a.filename) AS attachments

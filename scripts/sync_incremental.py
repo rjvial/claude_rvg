@@ -25,7 +25,6 @@ from _common import (
     DATA_DIR,
     SCRIPTS,
     force_utf8,
-    is_excluded_category,
     neo4j_driver,
     run_step,
 )
@@ -36,8 +35,8 @@ EMAILS_JSONL = DATA_DIR / "emails.jsonl"
 
 sys.path.insert(0, str(SCRIPTS))
 from pull_gmail import (  # noqa: E402
-    DEFAULT_QUERY_SUFFIX,
     SPAM_QUERY,
+    query_suffix,
     _exec_with_retry,
     append_pulled_id,
     fetch_message,
@@ -167,7 +166,13 @@ def apply_spam_changes(label: str, became_spam: set[str],
     view matches Gmail after a message was marked (or un-marked) spam in
     another client. Mirrors apply_read_changes: the WHERE guards count only
     nodes that actually changed. became_not_spam also restores INBOX, matching
-    the app's own Not-spam action."""
+    the app's own Not-spam action.
+
+    m.bucket is kept in lock-step with the SPAM flip: a now-spam message becomes
+    the 'spam' lite bucket; an un-spammed one falls back to its category bucket
+    (or 'primary'), re-derived from the surviving labels — same rule as
+    _common.message_bucket(). Without this, an un-spammed promo would keep
+    bucket='spam' and stay lite forever."""
     if not became_spam and not became_not_spam:
         return 0
     drv = neo4j_driver()
@@ -180,7 +185,13 @@ def apply_spam_changes(label: str, became_spam: set[str],
                     MATCH (m:Message {gmail_message_id: mid,
                                       account_owner: $acct})
                     WHERE 'SPAM' IN coalesce(m.label_ids, [])
-                    SET m.label_ids =
+                    SET m.bucket = CASE
+                            WHEN 'CATEGORY_PROMOTIONS' IN m.label_ids THEN 'promotions'
+                            WHEN 'CATEGORY_SOCIAL'     IN m.label_ids THEN 'social'
+                            WHEN 'CATEGORY_UPDATES'    IN m.label_ids THEN 'updates'
+                            WHEN 'CATEGORY_FORUMS'     IN m.label_ids THEN 'forums'
+                            ELSE 'primary' END,
+                        m.label_ids =
                         [x IN m.label_ids
                            WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'INBOX'
                 """, mids=list(became_not_spam), acct=label).consume()
@@ -191,7 +202,8 @@ def apply_spam_changes(label: str, became_spam: set[str],
                     MATCH (m:Message {gmail_message_id: mid,
                                       account_owner: $acct})
                     WHERE NOT 'SPAM' IN coalesce(m.label_ids, [])
-                    SET m.label_ids =
+                    SET m.bucket = 'spam',
+                        m.label_ids =
                         [x IN coalesce(m.label_ids, [])
                            WHERE x <> 'INBOX'] + 'SPAM'
                 """, mids=list(became_spam), acct=label).consume()
@@ -205,7 +217,10 @@ def new_msg_ids_via_date(service, since_ts_ms: int) -> list[str]:
     """Fallback: list messages after a given internal-date ms."""
     since = datetime.fromtimestamp(since_ts_ms / 1000, tz=timezone.utc)
     day = since.strftime("%Y/%m/%d")
-    query = f"after:{day} {DEFAULT_QUERY_SUFFIX}"
+    # Include categorized mail in the fallback re-list (history-gap recovery):
+    # going forward the sync keeps promo/social/updates/forums as lite-tier
+    # nodes, so this catch-up query must not exclude them either.
+    query = f"after:{day} {query_suffix(include_categories=True)}"
     return list(list_message_ids(service, query))
 
 
@@ -300,7 +315,6 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
     latest_internal_ms: int | None = state.get("last_internal_date_ms")
 
     skipped_drafts = 0
-    skipped_categorized = 0
     new_records: list[dict] = []
     with EMAILS_JSONL.open("a", encoding="utf-8") as out:
         for mid in tqdm(to_fetch, desc=f"fetch[{label}]"):
@@ -317,16 +331,11 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
                 append_pulled_id(label, mid)
                 skipped_drafts += 1
                 continue
-            # Same story for Gmail's auto-categories: the history API ignores
-            # the backfill's -category: filter, so promo/social/updates/forums
-            # mail would slip into the graph only via incremental sync — making
-            # promotional senders (e.g. Lider) appear to "start" the day sync
-            # began. Drop them here to match the backfill (is_excluded_category
-            # exempts spam, which we pull deliberately for the Spam page).
-            if is_excluded_category(rec_labels):
-                append_pulled_id(label, mid)
-                skipped_categorized += 1
-                continue
+            # Categorized mail (promo/social/updates/forums) is NO LONGER
+            # dropped — it's kept as a lite-tier node, tagged at load time by
+            # message_bucket(). So the incremental path now persists it like any
+            # other message; load_neo4j sets m.bucket and the downstream
+            # embed/cluster/retrieval steps skip non-'primary' buckets.
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
             append_pulled_id(label, mid)
             new_records.append(rec)
@@ -337,9 +346,6 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
 
     if skipped_drafts:
         print(f"  Skipped {skipped_drafts} draft message(s) for {label}.")
-    if skipped_categorized:
-        print(f"  Skipped {skipped_categorized} promo/social/updates/forums "
-              f"message(s) for {label}.")
     save_sync_state(label, latest_history_id, latest_internal_ms)
     return new_records, changed
 

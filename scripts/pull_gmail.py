@@ -63,16 +63,29 @@ DATA_DIR = ROOT / "data"
 CREDENTIALS_PATH = DATA_DIR / "credentials.json"
 EMAILS_JSONL = DATA_DIR / "emails.jsonl"
 
-DEFAULT_QUERY_SUFFIX = (
-    " ".join(f"-category:{c}" for c in EXCLUDED_CATEGORIES) + " "
-    # Drop drafts at the source. Each compose-window autosave creates its own
-    # DRAFT-labeled Message with a distinct gmail_message_id, so without this
-    # filter the graph ends up with N draft copies alongside the eventual sent
-    # message. The history API in sync_incremental ignores this query, so a
-    # belt-and-suspenders DRAFT label check in the fetch loop catches anything
-    # that slips through.
-    "-in:draft"
-)
+# Drop drafts at the source. Each compose-window autosave creates its own
+# DRAFT-labeled Message with a distinct gmail_message_id, so without this filter
+# the graph ends up with N draft copies alongside the eventual sent message. The
+# history API in sync_incremental ignores this query, so a belt-and-suspenders
+# DRAFT label check in the fetch loop catches anything that slips through.
+_DRAFT_FILTER = "-in:draft"
+
+
+def query_suffix(include_categories: bool = False) -> str:
+    """Trailing Gmail-query filters for a date backfill. By default the
+    promo/social/updates/forums auto-categories are excluded, so the
+    full-history backfill stays category-free. Pass include_categories=True to
+    drop the -category: clauses and fetch categorized mail too — used by the
+    bounded `--include-categories` pull and by the incremental sync, which now
+    keeps categorized mail as lite-tier nodes (see _common.message_bucket).
+    Drafts are always excluded."""
+    cats = ("" if include_categories
+            else " ".join(f"-category:{c}" for c in EXCLUDED_CATEGORIES) + " ")
+    return cats + _DRAFT_FILTER
+
+
+# Backward-compatible constant: the category-excluding suffix (full backfill).
+DEFAULT_QUERY_SUFFIX = query_suffix()
 
 # Spam is excluded from the normal pull (includeSpamTrash defaults off). Listed
 # separately so the app's Spam page mirrors Gmail. Scoped to in:spam so the
@@ -444,6 +457,10 @@ def main() -> None:
                         help="Gmail-style after date YYYY-MM-DD.")
     parser.add_argument("--query", type=str, default=None,
                         help="Override the Gmail search query entirely.")
+    parser.add_argument("--include-categories", action="store_true",
+                        help="Drop the -category: exclusions so promo/social/"
+                        "updates/forums mail is fetched too (lite tier). Use "
+                        "with --since for the bounded categorized backfill.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Stop after fetching N new messages.")
     args = parser.parse_args()
@@ -461,7 +478,7 @@ def main() -> None:
         query = args.query
     else:
         day = args.since.replace("-", "/")
-        query = f"after:{day} {DEFAULT_QUERY_SUFFIX}"
+        query = f"after:{day} {query_suffix(args.include_categories)}"
     print(f"Query: {query}")
 
     service = gmail_service(args.account)
