@@ -596,7 +596,7 @@ PAGE = r"""<!DOCTYPE html>
   .acctf .opt i{flex:none}
   .acctf .opt.all{border-bottom:1px solid var(--line);border-radius:0;
     margin:0 0 3px;padding-bottom:6px}
-  #list{position:absolute;top:78px;left:0;right:0;bottom:0;overflow:auto}
+  #list{position:absolute;top:78px;left:0;right:0;bottom:26px;overflow:auto}
   #spacer{position:relative}
   .lrow{position:absolute;left:0;right:0;height:28px;display:flex;
     align-items:center;gap:9px;padding:0 16px;cursor:pointer;
@@ -621,7 +621,7 @@ PAGE = r"""<!DOCTYPE html>
   mark{background:#F1D9A3;color:var(--ink);border-radius:2px}
   .lrow.cursor mark{background:#F7E7BE}
   /* ---- thread (railroad) view ---- */
-  #thread{position:absolute;top:46px;left:0;right:0;bottom:0;overflow:auto;
+  #thread{position:absolute;top:46px;left:0;right:0;bottom:26px;overflow:auto;
     display:none}
   #legend{padding:7px 16px;display:flex;flex-wrap:wrap;gap:3px 12px;
     font-size:11px;border-bottom:1px solid var(--line)}
@@ -655,7 +655,7 @@ PAGE = r"""<!DOCTYPE html>
   .date{flex:none;color:var(--ink-3);font-variant-numeric:tabular-nums}
   .rel{flex:none;font-size:10.5px;font-weight:600}
   /* ---- detail panel: an embedded pane docked below the header ---- */
-  #panel{display:none;position:fixed;top:46px;right:0;bottom:0;width:380px;
+  #panel{display:none;position:fixed;top:46px;right:0;bottom:26px;width:380px;
     z-index:7;background:var(--surface);border-left:1px solid var(--line-2);
     padding:16px 18px;overflow:auto}
   /* When open, the list / filter bar / thread reflow into the space left
@@ -1085,19 +1085,24 @@ PAGE = r"""<!DOCTYPE html>
   #clrpop .custom input[type=color]{width:36px;height:24px;padding:0;
     border:1px solid var(--line-2);border-radius:6px;background:var(--raised);
     cursor:pointer}
-  /* mail-server status pill — shows the server starting / running / closing */
-  #hdr .srvpill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;
-    border-radius:20px;font-size:11.5px;font-weight:600;white-space:nowrap;
-    border:1px solid var(--line-2);background:var(--surface);color:var(--ink-2)}
-  #hdr .srvpill i{width:8px;height:8px;border-radius:50%;background:var(--ink-3);
+  /* bottom status band — server status (left) + message counts (right) */
+  #statusbar{position:fixed;left:0;right:0;bottom:0;height:26px;z-index:6;
+    display:flex;align-items:center;gap:14px;padding:0 14px;
+    background:var(--surface);border-top:1px solid var(--line)}
+  #statusbar .sub{margin-left:auto;white-space:nowrap;color:var(--ink-3);
+    font-size:11px}
+  /* server-status indicator (dot + label): starting / running / closing */
+  .srvpill{display:inline-flex;align-items:center;gap:6px;font-size:11px;
+    font-weight:600;white-space:nowrap;color:var(--ink-2)}
+  .srvpill i{width:8px;height:8px;border-radius:50%;background:var(--ink-3);
     flex-shrink:0}
-  #hdr .srvpill.running{color:#2E7D45;border-color:#bfe0cb}
-  #hdr .srvpill.running i{background:#2E9D58}
-  #hdr .srvpill.starting{color:#9A6B27;border-color:#e8d3b0}
-  #hdr .srvpill.starting i{background:#E0A458;animation:srvpulse 1s infinite}
-  #hdr .srvpill.closing,#hdr .srvpill.stopped{color:#A84A43;border-color:#e3bdb8}
-  #hdr .srvpill.closing i{background:#C25C54;animation:srvpulse 1s infinite}
-  #hdr .srvpill.stopped i{background:#C25C54}
+  .srvpill.running{color:#2E7D45}
+  .srvpill.running i{background:#2E9D58}
+  .srvpill.starting{color:#9A6B27}
+  .srvpill.starting i{background:#E0A458;animation:srvpulse 1s infinite}
+  .srvpill.closing,.srvpill.stopped{color:#A84A43}
+  .srvpill.closing i{background:#C25C54;animation:srvpulse 1s infinite}
+  .srvpill.stopped i{background:#C25C54}
   @keyframes srvpulse{0%,100%{opacity:1}50%{opacity:.3}}
   /* power button — closes the app, but stops the server first (see #quitveil) */
   #hdr #powerbtn{background:var(--surface);color:var(--ink-2);
@@ -1136,7 +1141,6 @@ PAGE = r"""<!DOCTYPE html>
   <button id="rmbtn" style="display:none"
     title="Move selected messages to Gmail Trash">⌫ Remove (0)</button>
   <h1 id="title" style="display:none">All mail</h1>
-  <span class="sub" id="sub">__COUNT__ messages · __CONVS__ conversations</span>
   <input id="search" type="search"
     title="Prefix a term with | to negate it, e.g. |raimundo hides rows containing raimundo"
     placeholder="Filter by text, or from: to: cc: subject: has:attachment is:unread (| to negate)">
@@ -1146,11 +1150,14 @@ PAGE = r"""<!DOCTYPE html>
   <div class="acctf bucketf" id="bucketf"
     title="Filter by mail bucket (primary vs promotions/social/updates/forums/spam)"></div>
   <button id="acctsbtn" title="Settings: email accounts, LLM model, Claude sign-in">⚙ Settings</button>
-  <span id="srvpill" class="srvpill starting" title="Mail server status">
-    <i></i><span id="srvpilltxt">Starting…</span></span>
   <button id="powerbtn" title="Close the app — stops the mail server first">⏻</button>
 </div>
 <div id="banner">↻ New mail synced — click to reload</div>
+<div id="statusbar">
+  <span id="srvpill" class="srvpill starting" title="Mail server status">
+    <i></i><span id="srvpilltxt">Starting…</span></span>
+  <span class="sub" id="sub">__COUNT__ messages · __CONVS__ conversations</span>
+</div>
 <div id="quitveil">
   <div class="qcard">
     <img class="qlogo" src="/icon.svg" alt="">
