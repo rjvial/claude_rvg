@@ -539,33 +539,16 @@ PAGE = r"""<!DOCTYPE html>
   #cols{position:absolute;top:46px;left:0;right:0;height:32px;z-index:5;
     display:flex;align-items:center;gap:9px;padding:0 16px;
     background:var(--surface);border-bottom:1px solid var(--line)}
-  /* Filter pane is collapsed by default; the #colstoggle wedge flips it.
-     When hidden, the list rises to fill the freed row. */
-  body.cols-hidden #cols{display:none}
-  body.cols-hidden #list{top:46px}
-  /* Far-left header stack: the select-all checkbox (shown only in select
-     mode) sits ABOVE the filter-pane chevron, which is pushed to the bottom.
-     Fixed height ≤ the other buttons so the 46px header doesn't grow — the
-     list/thread top offsets assume 46px. */
+  /* Filter band is always visible in list view (hidden only in thread view,
+     driven from applyColsVisibility). */
   /* Far-left header stack. #leftctl stretches to the header's content height
-     and centers the select-all checkbox, so it lines up on the same row as
-     the Select/Cancel button. The chevron is absolutely pinned just below the
-     checkbox (in the header's bottom padding) so it never grows the fixed
-     46px header that the list/thread top offsets depend on. */
+     and centers the select-all checkbox (shown only in select mode), so it
+     lines up on the same row as the Select/Cancel button. */
   #leftctl{position:relative;align-self:stretch;width:16px;
     display:flex;align-items:center;justify-content:center}
   #hdr #f-sel-all{margin:0;width:12px;height:12px;cursor:pointer;
     accent-color:var(--accent)}
   body:not(.select-mode) #hdr #f-sel-all{display:none}
-  /* Filter-pane toggle: a borderless chevron under the checkbox. Higher
-     specificity than `#hdr button` so it stays flat. */
-  #hdr #colstoggle{position:absolute;left:50%;top:100%;
-    transform:translate(-50%,-4px);padding:0;border:0;background:transparent;
-    color:var(--ink-3);font-size:12px;line-height:1;cursor:pointer;
-    transition:color .15s ease, transform .2s ease}
-  #hdr #colstoggle:hover{color:var(--accent)}
-  /* rotate the chevron down when the pane is open (keep the centering shift) */
-  body:not(.cols-hidden) #hdr #colstoggle{transform:translate(-50%,-4px) rotate(90deg)}
   #cols input{width:100%;min-width:0;background:var(--raised);color:var(--ink);
     border:1px solid var(--line-2);border-radius:5px;padding:3px 7px;
     font-size:11px}
@@ -933,17 +916,6 @@ PAGE = r"""<!DOCTYPE html>
   /* ---- floating-window chrome shared by compose + Ask Liam ------------- */
   .askhd, .chd{cursor:move;user-select:none}
   .winctl{margin-left:auto;display:flex;align-items:center;gap:8px}
-  .winbtn{background:var(--raised);border:1px solid var(--line-2);
-    color:var(--ink-3);cursor:pointer;width:24px;height:22px;border-radius:5px;
-    font-size:13px;line-height:1;padding:0;display:inline-flex;
-    align-items:center;justify-content:center}
-  .winbtn:hover{border-color:var(--accent);color:var(--accent-deep)}
-  .askcard.winmax, .ccard.winmax{top:46px!important;left:8px!important;
-    transform:none!important;width:calc(100vw - 16px)!important;
-    height:calc(100vh - 54px)!important;resize:none;
-    max-width:none;max-height:none}
-  .askcard.winmin, .ccard.winmin{height:auto!important;resize:none}
-  .askcard.winmin > :not(.askhd), .ccard.winmin > :not(.chd){display:none}
   #cform{flex:1;display:flex;flex-direction:column;padding:11px 16px;gap:8px;
     overflow-y:auto;min-height:0}
   #cform .crow{display:grid;grid-template-columns:64px 1fr;gap:9px;
@@ -1121,11 +1093,10 @@ PAGE = r"""<!DOCTYPE html>
   #quitveil .qbar>i{display:block;height:100%;width:35%;border-radius:3px;
     background:var(--accent);animation:slideq 1.1s ease-in-out infinite}
   @keyframes slideq{0%{margin-left:-35%}100%{margin-left:100%}}
-</style></head><body class="cols-hidden">
+</style></head><body>
 <div id="hdr">
   <div id="leftctl">
     <input type="checkbox" id="f-sel-all" title="Select all visible rows">
-    <button id="colstoggle" title="Show filters">›</button>
   </div>
   <button id="back">← All mail</button>
   <button id="selbtn"
@@ -1222,8 +1193,6 @@ PAGE = r"""<!DOCTYPE html>
     <div class="askhd">✦ Liam — your mail assistant
       <span class="winctl">
         <button class="asknew" id="asknew" title="Start a new conversation">+ New chat</button>
-        <button class="winbtn" id="amin" title="Minimize">–</button>
-        <button class="winbtn" id="amax" title="Maximize / restore">▢</button>
         <span class="x" id="askx">✕</span></span></div>
     <div id="asklog"></div>
     <div class="row2">
@@ -1268,8 +1237,6 @@ PAGE = r"""<!DOCTYPE html>
   <div class="ccard">
     <div class="chd"><span id="ctitle">New message</span>
       <span class="winctl">
-        <button class="winbtn" id="cmin" title="Minimize">–</button>
-        <button class="winbtn" id="cmax" title="Maximize / restore">▢</button>
         <span class="x" id="cx">✕</span></span></div>
     <div id="cform">
       <div class="crow"><span class="clab">From</span>
@@ -2918,28 +2885,21 @@ function showList(){
     $("readbtn").style.display = "inline-block";
   }
   updateSpamButtons();           // view-specific; self-gate on selectMode
-  applyColsVisibility();         // honour the filter-pane toggle + show wedge
+  applyColsVisibility();         // show the filter band (list view only)
   updateSub();
   closePanel();
   renderList();
 }
 $("back").addEventListener("click", showList);
 
-// Filter pane (#cols) is collapsed by default; the #colstoggle wedge flips it.
-// showThread/showList set #cols' inline display, so we drive it from one place
-// that also accounts for thread view (where the pane is always hidden).
+// Filter band (#cols) is always visible in list view, hidden only in thread
+// view. showThread/showList set #cols' inline display, so we drive it from one
+// place.
 function applyColsVisibility(){
-  const show = !thrOpen && !document.body.classList.contains("cols-hidden");
-  $("cols").style.display = show ? "flex" : "none";
-  // The left control stack (select-all + chevron) is a list-only affordance.
+  $("cols").style.display = thrOpen ? "none" : "flex";
+  // The left control stack (select-all checkbox) is a list-only affordance.
   $("leftctl").style.display = thrOpen ? "none" : "flex";
 }
-function toggleCols(){
-  const hidden = document.body.classList.toggle("cols-hidden");
-  $("colstoggle").title = hidden ? "Show filters" : "Hide filters";
-  applyColsVisibility();
-}
-$("colstoggle").addEventListener("click", toggleCols);
 
 // --- bucket (tier) filter: a multi-select dropdown in the header bar that
 // replaces the old Spam toggle. Mirrors buildAcctFilter(): 'primary' shows by
@@ -3080,56 +3040,71 @@ function newChat(){
     + "the conversation, so follow-up questions work.");
 }
 function openAsk(){
-  document.querySelector(".askcard").classList.remove("winmin");  // never reopen collapsed
-  $("ask").style.display = "flex"; $("askq").focus();
+  $("ask").style.display = "flex";
+  document.querySelector("#ask .askcard")._raise?.();   // bring to front when opened
+  $("askq").focus();
 }
 function closeAsk(){ $("ask").style.display = "none"; }
 
-// --- floating-window chrome: drag + minimize + maximize (compose & Ask) ----
-// Both panels are now non-modal windows. The header is a drag handle (clicks on
-// its buttons/inputs are ignored); resize is the native CSS grip in the bottom-
-// right corner; min/max toggle classes the CSS handles. Geometry persists across
-// open/close (except winmin, which open clears) so a window reopens where left.
+// --- floating-window chrome: drag (compose & Ask) --------------------------
+// Both panels are non-modal windows. The header is a drag handle (clicks on its
+// buttons/inputs are ignored); resize is the native CSS grip in the bottom-right
+// corner. Geometry persists across open/close so a window reopens where left.
+// When both are open and overlapping, clicking one raises it above the other.
+// They swap between two fixed levels (30 front / 29 back) — both must stay
+// BELOW the Settings backdrop (#accts, 31) and the recipient autocomplete
+// (#cdrop, 40), so we can't just climb an unbounded counter.
+const _winPanels = [];           // overlay layers (#ask / #compose)
 function makeWindow(card, header){
-  let drag = false, sx = 0, sy = 0, ox = 0, oy = 0;
-  header.addEventListener("mousedown", e => {
+  let sx = 0, sy = 0, ox = 0, oy = 0;
+  // The overlay layer (#ask / #compose) is the card's parent; raise it on any
+  // interaction. Capture phase so it fires even when clicking inner controls.
+  const panel = card.parentElement;
+  _winPanels.push(panel);
+  const raise = () => {
+    _winPanels.forEach(p => p.style.zIndex = 29);
+    panel.style.zIndex = 30;
+  };
+  card.addEventListener("pointerdown", raise, true);
+  card._raise = raise;            // let open handlers bring a window to front
+  // Drag the window by its header with the LEFT mouse button. Pointer Events +
+  // setPointerCapture keep the move/up stream flowing even when the cursor
+  // leaves the header (or the window), so the drag can't get lost or stuck.
+  header.addEventListener("pointerdown", e => {
+    if(e.button !== 0) return;                         // left button only
     if(e.target.closest("button, input, select, textarea, .x")) return;
-    if(card.classList.contains("winmax")) return;     // no drag while maximized
     const r = card.getBoundingClientRect();
     card.style.transform = "none";                    // drop the centering shift
     card.style.left = r.left + "px";
     card.style.top  = r.top  + "px";
-    drag = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+    sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+    header.setPointerCapture(e.pointerId);
     document.body.style.userSelect = "none";
     e.preventDefault();
   });
-  window.addEventListener("mousemove", e => {
-    if(!drag) return;
+  header.addEventListener("pointermove", e => {
+    if(!header.hasPointerCapture(e.pointerId)) return;  // only while dragging
     const w = card.offsetWidth;
     let nx = ox + (e.clientX - sx), ny = oy + (e.clientY - sy);
     nx = Math.max(60 - w, Math.min(nx, window.innerWidth - 60));  // keep a sliver
     ny = Math.max(0, Math.min(ny, window.innerHeight - 36));
     card.style.left = nx + "px"; card.style.top = ny + "px";
   });
-  window.addEventListener("mouseup", () => {
-    if(drag){ drag = false; document.body.style.userSelect = ""; }
-  });
-  const min = () => { card.classList.remove("winmax"); card.classList.toggle("winmin"); };
-  const max = () => { card.classList.remove("winmin"); card.classList.toggle("winmax"); };
-  header.addEventListener("dblclick", e => {
-    if(e.target.closest("button, input, select, textarea, .x")) return;
-    max();
-  });
-  return { min, max };
+  const endDrag = e => {
+    if(header.hasPointerCapture(e.pointerId))
+      header.releasePointerCapture(e.pointerId);
+    document.body.style.userSelect = "";
+  };
+  header.addEventListener("pointerup", endDrag);
+  header.addEventListener("pointercancel", endDrag);
 }
-const _askWin = makeWindow(document.querySelector(".askcard"),
-                           document.querySelector("#ask .askhd"));
-const _cmpWin = makeWindow(document.querySelector(".ccard"),
-                           document.querySelector("#compose .chd"));
-$("amin").addEventListener("click", _askWin.min);
-$("amax").addEventListener("click", _askWin.max);
-$("cmin").addEventListener("click", _cmpWin.min);
-$("cmax").addEventListener("click", _cmpWin.max);
+// NB: scope to "#ask .askcard" — the Settings panel (#accts) also uses
+// class .askcard and comes first in the DOM, so a bare ".askcard" selector
+// grabs the hidden Settings card (zero-size) and the drag moves nothing.
+makeWindow(document.querySelector("#ask .askcard"),
+           document.querySelector("#ask .askhd"));
+makeWindow(document.querySelector(".ccard"),
+           document.querySelector("#compose .chd"));
 async function runAsk(){
   const q = $("askq").value.trim();
   if(!q) return;
@@ -4035,8 +4010,8 @@ async function openCompose(mode, srcIdx){
   // "dirty", so an immediate cancel after opening doesn't prompt.
   cBaseline = formSnapshot();
 
-  document.querySelector(".ccard").classList.remove("winmin");  // never reopen collapsed
   $("compose").style.display = "flex";
+  document.querySelector(".ccard")._raise?.();     // bring to front when opened
   // Cursor in body for reply/forward (so user can start typing above the
   // quote); To for a new message.
   (cMode === "new" ? $("cto") : $("cbody")).focus();

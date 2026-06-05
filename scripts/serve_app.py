@@ -934,71 +934,6 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
 _srv = None
 
 
-# Disk snapshot of the last rendered page, so a cold launch can serve the real
-# app instantly while Docker/Neo4j/rebuild() run in the background (the main
-# first-launch pain point). The browser loads slightly-stale mail immediately;
-# when rebuild() lands it bumps the version and the existing reload banner offers
-# the fresh data. Both blobs are stored gzipped (what the wire wants anyway).
-_SNAP_HTML_GZ = DATA_DIR / "page_snapshot.html.gz"
-_SNAP_PAYLOAD_GZ = DATA_DIR / "page_snapshot.payload.json.gz"
-_SNAP_META = DATA_DIR / "page_snapshot.meta.json"
-
-
-def _save_disk_snapshot(html_gz: bytes, payload_gz: bytes,
-                        messages: int, version: int, page_hash: str) -> None:
-    """Persist the rendered page atomically. Best-effort — never raises.
-
-    `page_hash` fingerprints the render template so a code/template change (not
-    just a data change) invalidates the snapshot on the next boot — otherwise the
-    rebuild no-op fast path would keep serving a page rendered by old code."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        for path, blob in ((_SNAP_HTML_GZ, html_gz),
-                           (_SNAP_PAYLOAD_GZ, payload_gz)):
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_bytes(blob)
-            tmp.replace(path)
-        meta = {"messages": messages, "version": version, "page_hash": page_hash}
-        tmp = _SNAP_META.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(meta), encoding="utf-8")
-        tmp.replace(_SNAP_META)
-    except Exception as e:
-        print(f"[serve] snapshot save skipped: {e}")
-
-
-def _install_disk_snapshot() -> bool:
-    """Load the last disk snapshot into _state so "/" serves the real app at
-    once. Returns True if a usable snapshot was installed, else False (caller
-    falls back to the loading splash). The baked-in page version equals the
-    snapshot's, so once the background rebuild bumps past it the client's reload
-    banner fires — even if rebuild finishes before the client's SSE connects."""
-    try:
-        if not (_SNAP_HTML_GZ.exists() and _SNAP_PAYLOAD_GZ.exists()
-                and _SNAP_META.exists()):
-            return False
-        html_gz = _SNAP_HTML_GZ.read_bytes()
-        payload_gz = _SNAP_PAYLOAD_GZ.read_bytes()
-        meta = json.loads(_SNAP_META.read_text(encoding="utf-8"))
-        html = gzip.decompress(html_gz).decode("utf-8")
-        payload_json = gzip.decompress(payload_gz).decode("utf-8")
-        with _state_cv:
-            _state["html"] = html
-            _state["html_gz"] = html_gz
-            _state["payload_json"] = payload_json
-            _state["payload_gz"] = payload_gz
-            _state["messages"] = int(meta.get("messages", 0))
-            _state["version"] = int(meta.get("version", 0))
-            _state["page_hash"] = meta.get("page_hash", "")
-            _state_cv.notify_all()
-        print(f"[serve] served disk snapshot — {_state['messages']:,} messages "
-              f"(version {_state['version']}); refreshing from Neo4j in the "
-              f"background")
-        return True
-    except Exception as e:
-        print(f"[serve] snapshot load skipped: {e}")
-        return False
-
-
 def rebuild() -> None:
     """Re-query Neo4j, refresh the cached HTML + its gzipped form, and bring
     the body store up to date with emails.jsonl."""
@@ -1021,14 +956,13 @@ def rebuild() -> None:
     payload_json = json.dumps(payload, ensure_ascii=False)
     # Fingerprint the render template so a code/template change forces a re-render
     # even when the data is unchanged (otherwise the no-op fast path below would
-    # keep serving a snapshot rendered by old code after an upgrade + restart).
+    # keep serving a page rendered by old code after an upgrade + restart).
     import hashlib
     page_hash = hashlib.md5(graph_app.PAGE.encode("utf-8")).hexdigest()
     # No-op fast path: if the rebuilt data AND the template are byte-identical to
-    # what's already cached, don't bump the version. This is the common case right
-    # after a cold launch — we served the disk snapshot, then this background
-    # rebuild finds nothing changed since last session — and a sync that pulled no
-    # new mail. Skipping the bump avoids a spurious "new data, reload" banner.
+    # what's already cached, don't bump the version. This happens when a periodic
+    # sync pulls no new mail. Skipping the bump avoids a spurious "new data,
+    # reload" banner.
     with _lock:
         cur_v = _state["version"]
         unchanged = (cur_v > 0 and payload_json == _state["payload_json"]
@@ -1037,9 +971,9 @@ def rebuild() -> None:
         print(f"[serve] rebuild: no change (version {cur_v})")
         return
     # Bake the next version into the page up front (peek current + 1) so the
-    # client's baseline matches the data it loads. With the disk snapshot served
-    # at boot, the background rebuild may bump the version before the client's
-    # SSE stream connects; baking keeps the reload banner correct in that race.
+    # client's baseline matches the data it loads. The background rebuild may bump
+    # the version before the client's SSE stream connects; baking keeps the reload
+    # banner correct in that race.
     v = cur_v + 1
     html = graph_app.render_page(payload, version=v)
     html_bytes = html.encode("utf-8")
@@ -1058,10 +992,6 @@ def rebuild() -> None:
         _state["version"] = v
         _state["page_hash"] = page_hash
         _state_cv.notify_all()
-    # Persist the rendered page to disk so the NEXT launch can serve it instantly
-    # (before Neo4j is even up) instead of blocking on the cold-start splash.
-    # Best-effort: a snapshot failure must never break a live rebuild.
-    _save_disk_snapshot(html_gz, payload_gz, len(payload["msgs"]), v, page_hash)
     print(f"[serve] cache rebuilt — {len(payload['msgs']):,} messages "
           f"(version {v}, {len(html_bytes)/1_048_576:.1f} MB → "
           f"{len(html_gz)/1_048_576:.1f} MB gzipped)")
@@ -3190,9 +3120,9 @@ def _neo4j_reachable() -> bool:
 
 
 # --- boot sequence ----------------------------------------------------------
-# Boot serves the disk snapshot (or a loading splash) immediately and runs the
-# slow work — ensure Neo4j is up → load the graph → build the page cache — in a
-# background thread. The splash polls /api/boot for `phase`/`ready`/`error` and
+# Boot serves the loading splash immediately and runs the slow work — ensure
+# Neo4j is up → load the graph → build the page cache — in a background thread.
+# The splash polls /api/boot for `phase`/`ready`/`error` and
 # reloads into the real app once `ready` flips true. /api/boot/retry re-runs a
 # failed boot. With native Neo4j the only thing shutdown reverses is a console
 # instance the app itself launched (see _shutdown_native_neo4j); a Windows
@@ -3385,6 +3315,70 @@ def _server_already_up(port: int) -> bool:
         return False
 
 
+def _force_kill_port(port: int) -> None:
+    """Force-terminate the process listening on `port`. Windows-first (netstat
+    + taskkill); falls back to lsof + kill elsewhere. Best-effort — never
+    raises. Used only when a graceful shutdown didn't free the port."""
+    try:
+        if sys.platform.startswith("win"):
+            out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+            pids, needle = set(), f":{port}"
+            for line in out.splitlines():
+                parts = line.split()
+                # LISTENING rows look like: TCP  127.0.0.1:8765  0.0.0.0:0  LISTENING  <pid>
+                if (len(parts) >= 5 and parts[-2] == "LISTENING"
+                        and parts[1].endswith(needle)):
+                    pids.add(parts[-1])
+            for pid in pids:
+                if pid and pid != "0":
+                    # No /T: don't take down child processes (e.g. a Neo4j
+                    # console) — the fresh server reuses a DB that's still up.
+                    subprocess.run(["taskkill", "/PID", pid, "/F"],
+                                   capture_output=True, timeout=5)
+        else:
+            out = subprocess.run(["lsof", "-ti", f"tcp:{port}"],
+                                 capture_output=True, text=True,
+                                 timeout=5).stdout
+            for pid in out.split():
+                subprocess.run(["kill", "-9", pid],
+                               capture_output=True, timeout=5)
+    except Exception as e:
+        print(f"[serve] force-kill skipped: {e}")
+
+
+def _kill_existing_server(port: int) -> None:
+    """Ensure no previous serve_app is holding the port before we start. A fresh
+    launch (double-clicking the mail icon) must always start a NEW server so
+    code/template changes take effect — never hand off to a stale one. Try a
+    graceful shutdown first (the same /api/shutdown the power button uses); if
+    the port doesn't free, force-kill whatever is listening on it."""
+    if not _server_already_up(port):
+        return
+    print(f"[serve] a previous server is running on :{port} — stopping it")
+    try:                                # 1) graceful: ask it to shut down
+        import urllib.request
+        urllib.request.urlopen(
+            urllib.request.Request(f"http://127.0.0.1:{port}/api/shutdown",
+                                   data=b"", method="POST"),
+            timeout=2)
+    except Exception:
+        pass
+    for _ in range(20):                 # 2) wait up to ~5s for the port to free
+        if not _server_already_up(port):
+            print("[serve] previous server stopped")
+            return
+        time.sleep(0.25)
+    _force_kill_port(port)              # 3) still up — force-kill it
+    for _ in range(12):                 # wait up to ~3s for the kill to land
+        if not _server_already_up(port):
+            print("[serve] previous server force-killed")
+            return
+        time.sleep(0.25)
+    print(f"[serve] WARNING: port :{port} still busy after kill attempts")
+
+
 def main() -> int:
     force_utf8()
 
@@ -3411,27 +3405,25 @@ def main() -> int:
             return
         (webbrowser.open if args.tab else _open_app_window)(url)
 
-    # Already running? Open the app window and exit instead of starting a
-    # second server. We can't rely on the bind failing: on Windows the socket
-    # defaults to SO_REUSEADDR, so a second ThreadingHTTPServer happily binds
-    # the SAME port — producing a zombie duplicate that gets no clients, never
-    # arms its idle watchdog, and lingers forever. So probe the port with a
-    # real request first, and also disable address reuse so a concurrent
-    # double-launch still loses the bind race instead of duplicating.
-    if _server_already_up(args.port):
-        print(f"A server is already running on :{args.port} — "
-              f"opening {url}")
-        open_ui()
-        return 0
+    # First thing: stop any previous server holding the port so this launch
+    # always starts a FRESH server (picking up code/template changes) instead
+    # of handing off to a stale one. We can't rely on the bind failing: on
+    # Windows the socket defaults to SO_REUSEADDR, so a second
+    # ThreadingHTTPServer would happily bind the SAME port — a zombie duplicate
+    # that gets no clients and lingers forever. So we probe + kill first, and
+    # also disable address reuse so a concurrent double-launch loses the bind
+    # race instead of duplicating.
+    _kill_existing_server(args.port)
     http.server.ThreadingHTTPServer.allow_reuse_address = False
     try:
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port),
                                               Handler)
     except OSError:
-        print(f"A server is already running on :{args.port} — "
-              f"opening {url}")
-        open_ui()
-        return 0
+        # Port still busy despite the kill attempt (a wedged process we
+        # couldn't terminate). Don't silently hand off to it — report and exit.
+        print(f"Port :{args.port} is still in use and could not be freed. "
+              f"Close any stray server and try again.")
+        return 1
     srv.daemon_threads = True
     global _srv
     _srv = srv                    # let /api/shutdown (the power button) stop us
@@ -3441,11 +3433,11 @@ def main() -> int:
     # thread and the splash reports progress via /api/boot until it's ready.
     global _sync_interval
     _sync_interval = args.interval
-    # Serve the last rendered page from disk immediately (instant cold start);
-    # only fall back to the loading splash if there's no snapshot yet. Either
-    # way the background boot starts Docker/Neo4j and rebuilds the live cache.
-    if not _install_disk_snapshot():
-        _install_loading_page()
+    # Always start on the loading page: a fresh launch must never flash a stale
+    # page from a previous run (it would hide just-changed code until the rebuild
+    # lands). The loading splash polls /api/boot and auto-reloads to the live
+    # page the moment the background boot (Neo4j + rebuild) is ready.
+    _install_loading_page()
     _start_boot()
     print(f"\nServing the mail app at {url}")
     print(f"Auto-syncs new mail every {args.interval}s. Ctrl+C to stop.\n")
