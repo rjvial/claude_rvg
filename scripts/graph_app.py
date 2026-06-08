@@ -356,7 +356,8 @@ MANIFEST_JSON = json.dumps({
 # the real app once the server reports ready; on failure it shows the error and
 # a Retry button (POST /api/boot/retry).
 LOADING_PAGE = r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Mail Graph</title>
+<html lang="en" translate="no"><head><meta charset="utf-8"><title>Mail Graph</title>
+<meta name="google" content="notranslate">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/svg+xml" href="/icon.svg">
 <style>
@@ -2783,7 +2784,8 @@ function popoutPanel(i){
       + `Open in Gmail ↗</a>`
     : "";
 
-  const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">`
+  const doc = `<!doctype html><html lang="en" translate="no"><head><meta charset="utf-8">`
+    + `<meta name="google" content="notranslate">`
     + `<title>${esc(m.subj || "(no subject)")}</title><style>${styles}</style>`
     + `</head><body>`
     + closeBtn
