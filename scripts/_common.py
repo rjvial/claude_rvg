@@ -39,7 +39,7 @@ _LABEL_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 # Gmail auto-categories we don't want in the graph: marketing, social-network
 # notifications, bulk "updates", and group/forum mail. Single source of truth,
 # used in three places that must stay in sync:
-#   - pull_gmail.DEFAULT_QUERY_SUFFIX derives its -category: clauses from this
+#   - pull_gmail.query_suffix() derives its -category: clauses from this
 #     (excludes them from the backfill at the Gmail API level);
 #   - sync_incremental drops messages carrying these labels in its fetch loop
 #     (the history API ignores the search query, so the backfill filter alone
@@ -49,24 +49,6 @@ _LABEL_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 # Spam is always exempt (it's pulled deliberately for the Spam page and may also
 # carry a CATEGORY_ label): callers gate on "SPAM not in labels" before this.
 EXCLUDED_CATEGORIES = ["promotions", "social", "updates", "forums"]
-# The matching Gmail label_ids (CATEGORY_<UPPER>).
-EXCLUDED_CATEGORY_LABELS = frozenset(
-    f"CATEGORY_{c.upper()}" for c in EXCLUDED_CATEGORIES
-)
-
-
-def is_excluded_category(label_ids) -> bool:
-    """True if a message should be dropped for being promo/social/updates/forums.
-    Spam is exempt — it's kept for the Spam page even when also categorized.
-
-    Kept for reference; the load/sync paths no longer DROP categorized mail —
-    they tag it with message_bucket() and give it the "lite" treatment instead.
-    pull_gmail still uses EXCLUDED_CATEGORIES to keep the full-history backfill
-    category-free (categorized mail is pulled separately, bounded)."""
-    labels = label_ids or []
-    if "SPAM" in labels:
-        return False
-    return bool(EXCLUDED_CATEGORY_LABELS.intersection(labels))
 
 
 # Gmail auto-category label_id -> bucket name. A Message's `bucket` decides its
@@ -82,8 +64,6 @@ CATEGORY_BUCKET = {
     "CATEGORY_UPDATES": "updates",
     "CATEGORY_FORUMS": "forums",
 }
-# The lite tiers (everything that isn't 'primary'). Used by downstream filters.
-LITE_BUCKETS = frozenset(CATEGORY_BUCKET.values()) | {"spam"}
 
 
 def message_bucket(label_ids) -> str:
@@ -91,8 +71,8 @@ def message_bucket(label_ids) -> str:
 
     Returns 'primary' (full pipeline) or a lite bucket name
     ('spam' / 'promotions' / 'social' / 'updates' / 'forums'). Spam wins over a
-    category label (a message can carry both), mirroring is_excluded_category's
-    spam-first rule; among categories the precedence is promotions > social >
+    category label (a message can carry both, spam-first); among categories the
+    precedence is promotions > social >
     updates > forums, though a message rarely carries two."""
     labels = set(label_ids or [])
     if "SPAM" in labels:
@@ -292,3 +272,30 @@ def gmail_search_url(stored_url: str | None,
         return ""
     return (f"https://mail.google.com/mail/?authuser={acct}"
             f"#search/rfc822msgid%3A{quote(rfc822_message_id, safe='')}")
+
+
+def gmail_open_url(stored_url: str | None) -> str:
+    """Account-pinned 'Open in Gmail' link.
+
+    The stored deep-link already carries ?authuser=<email>, but Gmail's SPA
+    ignores an email-form authuser when that account isn't the browser's
+    default and silently shows account u/0 instead — so a bidfabric/crug
+    message opens the wrong (gmail) mailbox and "finds nothing". Routing
+    through Google's AccountChooser with an explicit Email hint forces the
+    owning account: it selects that account when it's signed in, or offers a
+    sign-in for THAT account when it isn't — never a silent fallback to the
+    default. `continue` carries the real deep-link (fragment included; the
+    browser preserves it across the same-origin redirect).
+
+    Note: no link can render a mailbox the user isn't authenticated to in this
+    browser — that's a Google auth boundary. The in-app reader (message body +
+    attachment download) works for every account regardless, via the server's
+    own OAuth tokens, and is the reliable path when Gmail web can't open it."""
+    if not stored_url:
+        return ""
+    acct = _account_from_url(stored_url)
+    if not acct:
+        return stored_url
+    return ("https://accounts.google.com/AccountChooser?Email="
+            + quote(acct, safe="")
+            + "&continue=" + quote(stored_url, safe=""))

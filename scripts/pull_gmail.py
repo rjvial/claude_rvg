@@ -84,9 +84,6 @@ def query_suffix(include_categories: bool = False) -> str:
     return cats + _DRAFT_FILTER
 
 
-# Backward-compatible constant: the category-excluding suffix (full backfill).
-DEFAULT_QUERY_SUFFIX = query_suffix()
-
 # Spam is excluded from the normal pull (includeSpamTrash defaults off). Listed
 # separately so the app's Spam page mirrors Gmail. Scoped to in:spam so the
 # includeSpamTrash=True flag can't pull Trash. Bounded — Gmail purges spam ~30d.

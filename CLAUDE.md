@@ -2,7 +2,7 @@
 
 Gmail → Neo4j knowledge graph. Pulls mail from three accounts (you@gmail.com, you@work.example.com, you@org.example.com) and loads it into a single Neo4j graph tagged by `account\\\_owner`. Backfill once, daily incremental sync.
 
-**Deterministic only — no LLM entity extraction.** Orgs come from email-domain (Layer 2, via `data/orgs\\\_seed.json`). Keywords come from the curated `data/concepts.json` vocabulary (Layer 3b). LLM extraction was removed 2026-05-25; see `scripts/wipe\\\_llm\\\_extraction.cypher` for the one-time Neo4j migration.
+**Deterministic only — no LLM entity extraction.** Orgs come from email-domain (Layer 2, via `data/orgs\\\_seed.json`). LLM extraction was removed 2026-05-25; see `scripts/wipe\\\_llm\\\_extraction.cypher` for the one-time Neo4j migration.
 
 See `SETUP.md` for one-time setup (GCP OAuth, native Neo4j, venv). Neo4j runs as a **native Windows install** (no Docker, no WSL) under `C:\neo4j`; the app reaches it over Bolt at `bolt://localhost:7687` and, if no `neo4j` Windows service is registered, launches the bundled `neo4j console` itself.
 
@@ -35,11 +35,11 @@ python scripts\\\\run\\\_pipeline.py --months <N> \\\[--reset-data] \\\[--reset-
 python scripts\\\\run\\\_pipeline.py --all-time   \\\[--reset-data] \\\[--reset-graph]
 ```
 
-Orchestrator runs: pre-flight (venv, OAuth, Neo4j reachable over Bolt) → preloaded-state probe → optional reset → cleanup → pull → repair → clean → build-concepts → load → embed → cluster-matters → sanity → outputs-summary. All idempotent; interrupt and re-run freely (the embed step is a resumable checkpoint — only Messages still missing an embedding get encoded, so a re-run resumes where the previous one stopped). **Pulls stay sequential** — `pull\\\_gmail.py` has no file lock; parallel writes corrupt `emails.jsonl`.
+Orchestrator runs: pre-flight (venv, OAuth, Neo4j reachable over Bolt) → preloaded-state probe → optional reset → cleanup → pull → repair → clean → load → embed → cluster-matters → sanity → outputs-summary. All idempotent; interrupt and re-run freely (the embed step is a resumable checkpoint — only Messages still missing an embedding get encoded, so a re-run resumes where the previous one stopped). **Pulls stay sequential** — `pull\\\_gmail.py` has no file lock; parallel writes corrupt `emails.jsonl`.
 
 ## Entry points
 
-* `scripts/run\\\_pipeline.py` — orchestrates pull → repair → clean → build-concepts → load → embed → cluster
+* `scripts/run\\\_pipeline.py` — orchestrates pull → repair → clean → load → embed → cluster
 * `scripts/sync\\\_incremental.py` — daily delta sync (per account)
 * `scripts/serve\\\_app.py` — local app server (also via `mail.bat`); caches the rendered page at startup, so restart it after editing `graph\\\_app.py`
 * `scripts/pull\\\_gmail.py` / `pull\\\_calendar.py` — per-account pullers; **run sequentially**, never in parallel
@@ -54,7 +54,6 @@ Orchestrator runs: pre-flight (venv, OAuth, Neo4j reachable over Bolt) → prelo
 * `Thread` (compound: `gmail\\\_thread\\\_id` + `account\\\_owner`)
 * `Message` (compound: `gmail\\\_message\\\_id` + `account\\\_owner`) — `sent\\\_at`, `body\\\_clean`, `embedding`
 * `Attachment` (compound: `gmail\\\_message\\\_id` + `account\\\_owner` + `part\\\_id`)
-* `Concept` (`key`) — controlled vocabulary from `build\\\_concepts.py`
 * `Event` — calendar events, deduped on `(ical\\\_uid, start)`
 * `Matter` (`canonical\\\_key`) — multi-thread unification node from `cluster\\\_matters.py`
 
@@ -65,7 +64,6 @@ Orchestrator runs: pre-flight (venv, OAuth, Neo4j reachable over Bolt) → prelo
 * `Message -\\\[:HAS\\\_ATTACHMENT]-> Attachment`
 * `Message -\\\[:REPLY\\\_TO]-> Message`, `Message -\\\[:NEXT\\\_IN\\\_THREAD]-> Message`, `Thread -\\\[:STARTS\\\_WITH]-> Message`
 * `Person -\\\[:WORKS\\\_AT]-> Org` (from email domain via `orgs\\\_seed.json`)
-* `Message -\\\[:MENTIONS {count, in\\\_subject}]-> Concept`, `Thread -\\\[:MENTIONS]-> Concept`
 * `Event -\\\[:ORGANIZED]-> Person`, `Event -\\\[:INVITED]-> Person`
 
 Vector index on `Message.embedding` (1024-dim, cosine) for graph-RAG. Full-text index over subject + body\_clean.

@@ -102,9 +102,6 @@ RESET_DATA_PRESERVE = {
     ".gitkeep",
     "credentials.json",
     "orgs_seed.json",
-    # Curated reference dictionary (long-form → abbreviation); treated as
-    # data, not pipeline state.
-    "abbreviations.json",
 } | {f"token_{a}.json" for a in ACCOUNTS}
 
 

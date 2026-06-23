@@ -72,6 +72,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import gzip
 import http.server
 import json
@@ -83,7 +84,7 @@ import time
 import uuid
 import webbrowser
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, quote
 
 from _common import (
     DATA_DIR,
@@ -1597,6 +1598,71 @@ def _fetch_quote(mid: str, acct: str) -> dict | None:
     }
 
 
+def _part_data_b64(payload: dict, part_id: str) -> str | None:
+    """DFS the Gmail MIME tree for the part whose partId matches; return its
+    base64url body.data, or None. Used only for small attachments Gmail inlines
+    on the message instead of exposing a separate attachmentId."""
+    stack = [payload]
+    while stack:
+        p = stack.pop()
+        if (p.get("partId") or "") == part_id:
+            return (p.get("body") or {}).get("data")
+        stack.extend(p.get("parts") or [])
+    return None
+
+
+def _fetch_attachment(mid: str, acct: str, part: str) -> tuple[bytes, str, str]:
+    """Fetch one stored Attachment's bytes live from Gmail via the account's
+    existing token. Returns (raw_bytes, filename, mime_type). Raises
+    FileNotFoundError if the attachment isn't in the graph / on the message,
+    and other exceptions on auth or API failure — the caller maps these to
+    HTTP status codes."""
+    if not mid or not acct:
+        raise ValueError("missing message id or account")
+    import graph_app
+    drv = graph_app.driver()
+    try:
+        with drv.session() as s:
+            row = s.run(
+                "MATCH (m:Message {gmail_message_id:$mid, account_owner:$acct})"
+                "-[:HAS_ATTACHMENT]->(a:Attachment {part_id:$part}) "
+                "RETURN a.attachment_id AS aid, a.filename AS fn, "
+                "       a.mime_type AS mime",
+                mid=mid, acct=acct, part=part).single()
+    finally:
+        drv.close()
+    if not row:
+        raise FileNotFoundError("attachment not found in graph")
+    filename = row["fn"] or "attachment"
+    mime = row["mime"] or "application/octet-stream"
+
+    import pull_gmail
+    # Use the stored token directly (auto-refreshing via the saved refresh
+    # token). NOT gmail_service(), which would launch an interactive browser
+    # OAuth flow on a missing token and hang this request.
+    creds = pull_gmail.load_credentials(acct)
+    if creds is None:
+        raise RuntimeError(f"account '{acct}' is not authorized — sign in first")
+    service = pull_gmail.build(
+        "gmail", "v1", credentials=creds, cache_discovery=False)
+    aid = row["aid"]
+    if aid:
+        resp = pull_gmail._exec_with_retry(
+            service.users().messages().attachments().get(
+                userId="me", messageId=mid, id=aid))
+        data_b64 = resp.get("data") or ""
+    else:
+        # No attachmentId → the bytes are inlined on the part itself.
+        full = pull_gmail._exec_with_retry(
+            service.users().messages().get(
+                userId="me", id=mid, format="full"))
+        data_b64 = _part_data_b64(full.get("payload") or {}, part)
+        if not data_b64:
+            raise FileNotFoundError("attachment bytes not found on message")
+    raw = base64.urlsafe_b64decode(data_b64 + "=" * (-len(data_b64) % 4))
+    return raw, filename, mime
+
+
 def _do_compose(payload: dict) -> dict:
     """Sign + dispatch one compose request. Returns the JSON the client
     receives — {ok, id?, thread_id?, error?}."""
@@ -1667,6 +1733,32 @@ def _do_compose(payload: dict) -> dict:
                              f"`pull_gmail.py --account {acct} --auth` and "
                              f"pick the correct Google account."}
 
+        # User-uploaded files arrive as base64 in `attachments`. Forwarded
+        # files arrive as references (`forward_attachments` = [{mid, acct,
+        # part}]) — the bytes still live on the original Gmail message, so we
+        # fetch them server-side (via the OWNING account's token) and inline
+        # them. This keeps large attachments off the browser round-trip and
+        # out of the composer's 24 MB client cap.
+        attachments = list(payload.get("attachments") or [])
+        for f in payload.get("forward_attachments") or []:
+            f_mid = (f.get("mid") or "").strip()
+            f_acct = (f.get("acct") or "").strip()
+            f_part = (f.get("part") or "").strip()
+            if not (f_mid and f_acct):
+                continue
+            try:
+                raw_bytes, fn, mime = _fetch_attachment(f_mid, f_acct, f_part)
+            except Exception as e:
+                label = f.get("filename") or f_part or "(unknown)"
+                return {"ok": False,
+                        "error": f"could not attach forwarded file "
+                                 f"'{label}': "
+                                 f"{_safe_err('compose: forward attach', e)}"}
+            attachments.append({
+                "filename": fn, "mime": mime,
+                "data_b64": base64.b64encode(raw_bytes).decode("ascii"),
+            })
+
         raw = _send_mail.build_message(
             from_email=actual,    # use the verified address, not the cache
             to=to_list, cc=cc_list, bcc=bcc_list,
@@ -1675,7 +1767,7 @@ def _do_compose(payload: dict) -> dict:
             is_html=bool(payload.get("is_html")),
             in_reply_to=payload.get("in_reply_to") or None,
             references=payload.get("references") or [],
-            attachments=payload.get("attachments") or [],
+            attachments=attachments,
         )
 
         try:
@@ -2640,6 +2732,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "application/json")
                 return
             self._send(200, json.dumps(q), "application/json")
+        elif path == "/api/attach":
+            # Stream one attachment's bytes, fetched live from Gmail via the
+            # owning account's token. The graph stores the Gmail attachmentId
+            # per part, so no local blob storage is needed.
+            qs = parse_qs(self.path.partition("?")[2])
+            mid = (qs.get("mid") or [""])[0]
+            acct = (qs.get("acct") or [""])[0]
+            part = (qs.get("part") or [""])[0]
+            try:
+                raw, filename, mime = _fetch_attachment(mid, acct, part)
+            except (FileNotFoundError, ValueError) as e:
+                self._send(404, json.dumps({"error": str(e)}),
+                           "application/json")
+                return
+            except Exception as e:
+                self._send(500, json.dumps(
+                    {"error": _safe_err("api/attach", e)}),
+                    "application/json")
+                return
+            # Write the bytes directly — no gzip (most attachments are already
+            # compressed), no caching. Content-Disposition: inline lets the
+            # browser preview PDFs/images in a tab and download other types;
+            # RFC 5987 filename* carries non-ASCII names safely.
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header(
+                "Content-Disposition",
+                "inline; filename*=UTF-8''" + quote(filename, safe=""))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
             self._send(404, "not found", "text/plain")
 
