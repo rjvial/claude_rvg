@@ -82,6 +82,66 @@ MATCH (p:Person) WHERE p.email IS NOT NULL AND p.name IS NOT NULL
 RETURN p.email AS email, p.name AS name
 """
 
+# Everything fetch() knows about ONE message, for messages whose m.rev is
+# newer than the server's last rebuild — the delta feed behind serve_app's
+# incremental cache rebuild. Participants/attachments/edges ride along as
+# pattern comprehensions so one query patches the whole in-memory model.
+# Body is always the lean 400-char prefix (only serve_app uses this path).
+CHANGED_MESSAGES_CYPHER = """
+MATCH (m:Message)
+WHERE m.rev IS NOT NULL AND m.rev > $since
+OPTIONAL MATCH (m)-[:IN_THREAD]->(t:Thread)
+RETURN elementId(m) AS eid, m.subject AS subject, m.sent_at AS sent_at,
+       m.snippet AS snippet, left(m.body_clean, 400) AS body,
+       m.gmail_url AS gmail_url, m.rfc822_message_id AS rfc822,
+       m.account_owner AS acct, m.gmail_message_id AS mid,
+       t.gmail_thread_id AS tid, m.label_ids AS labels, m.bucket AS bucket,
+       m.from_name AS from_name,
+  [(p:Person)-[:SENT]->(m) WHERE p.email IS NOT NULL | p.email] AS frm,
+  [(m)-[r:RECEIVED_BY]->(p:Person) WHERE r.kind = 'to'  AND p.email IS NOT NULL | p.email] AS too,
+  [(m)-[r:RECEIVED_BY]->(p:Person) WHERE r.kind = 'cc'  AND p.email IS NOT NULL | p.email] AS ccc,
+  [(m)-[r:RECEIVED_BY]->(p:Person) WHERE r.kind = 'bcc' AND p.email IS NOT NULL | p.email] AS bccc,
+  [(m)-[:HAS_ATTACHMENT]->(a:Attachment) WHERE a.filename IS NOT NULL | a.filename] AS atts,
+  [(m)-[:HAS_ATTACHMENT]->(a:Attachment) WHERE a.filename IS NOT NULL | {fn: a.filename, pid: a.part_id}] AS attparts,
+  [(m)-[e:REPLY_TO|NEXT_IN_THREAD]->(b:Message) | [elementId(m), elementId(b), type(e)]] AS out_edges,
+  [(b:Message)-[e:REPLY_TO|NEXT_IN_THREAD]->(m) | [elementId(b), elementId(m), type(e)]] AS in_edges,
+  [(p:Person)-[:SENT]->(m) WHERE p.email IS NOT NULL AND p.name IS NOT NULL | {e: p.email, n: p.name}]
+  + [(m)-[:RECEIVED_BY]->(p:Person) WHERE p.email IS NOT NULL AND p.name IS NOT NULL | {e: p.email, n: p.name}] AS ppl
+"""
+
+
+def fetch_changed(driver, since: int) -> tuple[dict, list, dict]:
+    """Messages whose m.rev > `since`, in the same shapes fetch() returns:
+    (messages keyed by elementId, edge tuples touching them, people names of
+    their participants). serve_app patches these into its retained model
+    instead of re-fetching the whole graph after every sync."""
+    with driver.session() as s:
+        rows = s.execute_read(
+            lambda tx: tx.run(CHANGED_MESSAGES_CYPHER, since=since).data())
+    messages: dict[str, dict] = {}
+    edges: list[tuple] = []
+    people: dict[str, str] = {}
+    for r in rows:
+        messages[r["eid"]] = {
+            "subject": r["subject"], "sent_at": r["sent_at"] or "",
+            "snippet": r["snippet"], "body": r["body"],
+            "gmail_url": r["gmail_url"], "rfc822": r["rfc822"],
+            "acct": r["acct"], "tid": r["tid"], "mid": r["mid"],
+            "from_name": r["from_name"],
+            "unread": "UNREAD" in (r["labels"] or []),
+            "spam": "SPAM" in (r["labels"] or []),
+            "bucket": r["bucket"] or message_bucket(r["labels"]),
+            "from": r["frm"], "to": r["too"], "cc": r["ccc"],
+            "bcc": r["bccc"],
+            "atts": list(dict.fromkeys(r["atts"])),
+            "attp": r["attparts"],
+        }
+        for s_, t_, rt in (r["out_edges"] + r["in_edges"]):
+            edges.append((s_, t_, rt))
+        for p in r["ppl"]:
+            people[p["e"]] = p["n"]
+    return messages, edges, people
+
 
 class UnionFind:
     """Group messages into conversations (connected components)."""
@@ -125,11 +185,15 @@ def fetch(driver, lean: bool = False) -> tuple[dict, list, dict, dict]:
     if lean:
         msg_q = msg_q.replace("m.body_clean AS body",
                               "left(m.body_clean, 400) AS body")
+    # execute_read = managed transactions: transient failures (e.g. Neo4j
+    # still settling right after launch) retry instead of failing the fetch.
+    def _read(s, q):
+        return s.execute_read(lambda tx: tx.run(q).data())
     with driver.session() as s:
-        msg_rows = s.run(msg_q).data()
-        edge_rows = s.run(ALL_EDGES_CYPHER).data()
-        part_rows = s.run(PARTICIPANTS_CYPHER).data()
-        ppl_rows = s.run(PEOPLE_CYPHER).data()
+        msg_rows = _read(s, msg_q)
+        edge_rows = _read(s, ALL_EDGES_CYPHER)
+        part_rows = _read(s, PARTICIPANTS_CYPHER)
+        ppl_rows = _read(s, PEOPLE_CYPHER)
 
     messages: dict[str, dict] = {}
     for r in msg_rows:
@@ -215,6 +279,16 @@ def build_payload(driver, lean: bool = False) -> dict:
     snippet on open and upgrades to the real HTML via /api/body on click. It
     also tells fetch() to pull only the body prefix needed for the snippet."""
     messages, edges, people, _ = fetch(driver, lean=lean)
+    return assemble_payload(messages, edges, people, lean=lean)
+
+
+def assemble_payload(messages: dict, edges, people: dict,
+                     lean: bool = False) -> dict:
+    """Pure payload assembly from already-fetched graph data — no Neo4j
+    access. Split out of build_payload so serve_app's incremental rebuild can
+    keep (messages, edges, people) in memory, patch only what changed, and
+    re-assemble without re-reading the whole graph. Does not mutate its
+    inputs."""
     if not messages:
         return {"msgs": [], "palette": PALETTE, "people": {}}
 

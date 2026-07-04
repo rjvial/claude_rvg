@@ -36,6 +36,9 @@ from _common import DATA_DIR, message_bucket, neo4j_driver
 EMAILS_CLEAN_JSONL = DATA_DIR / "emails_clean.jsonl"
 ORGS_SEED_PATH = DATA_DIR / "orgs_seed.json"
 CALENDAR_EVENTS_JSONL = DATA_DIR / "calendar_events.jsonl"
+# Hand-edited alias groups (same file style_profiles.py reads): addresses of
+# one person whose display names don't auto-merge.
+RECIPIENT_ALIASES_PATH = DATA_DIR / "recipient_aliases.json"
 
 # Pre-migration drops: the single-property message_id / thread_id constraints
 # from earlier versions of this script must be dropped before we can apply the
@@ -74,6 +77,20 @@ CONSTRAINTS = [
     # Attachments are per-message, keyed by MIME part_id (stable per re-fetch).
     "CREATE CONSTRAINT attachment_key  IF NOT EXISTS FOR (a:Attachment) REQUIRE (a.gmail_message_id, a.account_owner, a.part_id) IS UNIQUE",
     "CREATE INDEX message_sent_at    IF NOT EXISTS FOR (m:Message) ON (m.sent_at)",
+    # Native temporal twin of sent_at (same instant, ZonedDateTime). The ISO
+    # string stays for the app payload and lexicographic ORDER BY; sent_dt
+    # gives Cypher real date arithmetic (date.truncate, durations, ranges)
+    # for the /api/ask aggregation queries.
+    "CREATE INDEX message_sent_dt   IF NOT EXISTS FOR (m:Message) ON (m.sent_dt)",
+    # Revision marker (ms) — backs serve_app's incremental cache rebuild
+    # (MATCH ... WHERE m.rev > $since).
+    "CREATE INDEX message_rev       IF NOT EXISTS FOR (m:Message) ON (m.rev)",
+    # Accent-folding people lookup: resolving "munoz" → the Person node for
+    # "María Muñoz" used to require searching message bodies. Same folding
+    # analyzer as message_text.
+    "CREATE FULLTEXT INDEX person_name IF NOT EXISTS "
+    "FOR (p:Person) ON EACH [p.name] "
+    "OPTIONS {indexConfig: {`fulltext.analyzer`: 'standard-folding'}}",
     # Treatment tier (primary vs lite buckets). Lets embed/cluster/retrieval
     # filter to bucket='primary' cheaply, and the app browse by bucket.
     "CREATE INDEX message_bucket     IF NOT EXISTS FOR (m:Message) ON (m.bucket)",
@@ -122,6 +139,14 @@ def setup_schema(driver) -> None:
             session.run(stmt)
         for stmt in CONSTRAINTS:
             session.run(stmt)
+        # Idempotent data backfill: sent_dt for nodes loaded before the
+        # property existed. session.run is auto-commit, which CALL … IN
+        # TRANSACTIONS requires.
+        session.run(
+            "MATCH (m:Message) "
+            "WHERE m.sent_dt IS NULL AND m.sent_at IS NOT NULL "
+            "CALL (m) { SET m.sent_dt = datetime(m.sent_at) } "
+            "IN TRANSACTIONS OF 10000 ROWS").consume()
     print("  Done.")
 
 
@@ -132,11 +157,31 @@ def setup_schema(driver) -> None:
 LOAD_MESSAGES_CYPHER = """
 UNWIND $rows AS row
 MERGE (t:Thread {gmail_thread_id: row.thread_id, account_owner: row.account_owner})
-  ON CREATE SET t.subject = row.subject, t.started_at = row.sent_at
-  ON MATCH  SET t.last_msg_at = row.sent_at
+  ON CREATE SET t.subject = row.subject, t.started_at = row.sent_at,
+                t.last_msg_at = row.sent_at
+  // Rows are NOT guaranteed chronological (backfill batches, re-pulls), so
+  // started_at/last_msg_at only move outward — a mid-thread row must not
+  // regress last_msg_at or inflate started_at. ISO-8601 UTC strings compare
+  // correctly as text.
+  ON MATCH  SET
+    t.started_at = CASE WHEN row.sent_at IS NOT NULL
+                         AND (t.started_at IS NULL OR row.sent_at < t.started_at)
+                        THEN row.sent_at ELSE t.started_at END,
+    t.last_msg_at = CASE WHEN row.sent_at IS NOT NULL
+                          AND (t.last_msg_at IS NULL OR row.sent_at > t.last_msg_at)
+                         THEN row.sent_at ELSE t.last_msg_at END
 MERGE (m:Message {gmail_message_id: row.message_id, account_owner: row.account_owner})
   ON CREATE SET
+    // Revision marker for the app server's incremental cache rebuild: every
+    // creation and every later label/spam mutation stamps m.rev with server
+    // time (ms), so serve_app can fetch "changed since my last rebuild"
+    // instead of re-reading the whole graph. Legacy nodes without rev are
+    // simply never re-fetched incrementally — correct, since any mutation
+    // path stamps rev when it touches them.
+    m.rev = timestamp(),
     m.sent_at = row.sent_at,
+    // Native datetime twin of the ISO string (datetime(null) is null-safe).
+    m.sent_dt = datetime(row.sent_at),
     m.subject = row.subject,
     m.snippet = row.snippet,
     m.body_clean = row.body_clean,
@@ -169,7 +214,9 @@ MERGE (m:Message {gmail_message_id: row.message_id, account_owner: row.account_o
                         THEN row.references ELSE m.references END,
     // Backfill legacy nodes that predate m.from_name; never null out a value
     // already present if a re-pulled row happens to lack the name.
-    m.from_name = coalesce(row.from_name, m.from_name)
+    m.from_name = coalesce(row.from_name, m.from_name),
+    // Backfill legacy nodes that predate m.sent_dt.
+    m.sent_dt = coalesce(m.sent_dt, datetime(row.sent_at))
 MERGE (m)-[:IN_THREAD]->(t)
 WITH m, row
 WHERE row.from_email IS NOT NULL
@@ -287,7 +334,11 @@ def load_messages(driver, batch: int) -> None:
             EMAILS_CLEAN_JSONL.open(encoding="utf-8") as fin, \
             tqdm(total=total, desc="messages") as bar:
         for line in fin:
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                bar.update(1)
+                continue
             # Promo/social/updates/forums mail is loaded like everything else —
             # msg_row() tags it with m.bucket (lite tier). The embed/cluster/
             # retrieval steps skip non-'primary' buckets, so the graph carries
@@ -408,7 +459,11 @@ def load_reply_edges(driver, batch: int) -> None:
             EMAILS_CLEAN_JSONL.open(encoding="utf-8") as fin, \
             tqdm(total=total, desc="reply-tree") as bar:
         for line in fin:
-            rec = json.loads(line)
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                bar.update(1)
+                continue
             rep_batch.append(reply_rows(rec))
             if len(rep_batch) >= batch:
                 session.run(LOAD_REPLY_EDGES_CYPHER, rows=rep_batch)
@@ -511,14 +566,35 @@ def load_domain_orgs(driver, seed: dict) -> None:
         session.run(LOAD_DOMAIN_ORGS_CYPHER, rows=rows)
 
 
+# Auto-derived Orgs: any non-personal sender/recipient domain seen on PRIMARY
+# mail that isn't in orgs_seed.json still becomes an Org (canonical_name =
+# the bare domain), so Liam's "resolve the org by domain" anchor works for
+# organizations that were never hand-seeded. Restricting to primary-bucket
+# participants keeps newsletter/promo sender domains from minting Org noise.
+AUTO_ORGS_CYPHER = """
+UNWIND $rows AS row
+MERGE (org:Org {canonical_name: row.canonical_name})
+  ON CREATE SET org.domain = row.domain, org.aliases = [],
+                org.source = 'auto_domain'
+  ON MATCH  SET org.domain = coalesce(org.domain, row.domain)
+"""
+
+
 def load_works_at(driver, seed: dict) -> None:
     domain_map: dict[str, dict] = seed.get("domains") or {}
     personal = set((seed.get("_meta") or {}).get("personal_email_providers") or [])
     rows: list[dict] = []
+    auto_domains: set[str] = set()
     with EMAILS_CLEAN_JSONL.open(encoding="utf-8") as fh:
         seen: set[tuple[str, str]] = set()
         for line in fh:
-            rec = json.loads(line)
+            # Tolerate blank/corrupt lines (an interrupted sync can leave a
+            # partial trailing line) — same guard reconcile_graph uses.
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            primary = message_bucket(rec.get("label_ids")) == "primary"
             for kind in ("from", "to", "cc", "bcc"):
                 v = rec.get(kind)
                 if isinstance(v, dict):
@@ -531,19 +607,135 @@ def load_works_at(driver, seed: dict) -> None:
                     if domain in personal:
                         continue
                     info = domain_map.get(domain)
-                    if not info:
+                    if info:
+                        canonical = info["canonical_name"]
+                    elif primary and "." in domain:
+                        canonical = domain          # auto-org, named by domain
+                        auto_domains.add(domain)
+                    else:
                         continue
-                    key = (email, info["canonical_name"])
+                    key = (email, canonical)
                     if key in seen:
                         continue
                     seen.add(key)
-                    rows.append({"email": email, "canonical_name": info["canonical_name"]})
+                    rows.append({"email": email, "canonical_name": canonical})
+    if auto_domains:
+        print(f"Layer 2b: creating {len(auto_domains)} auto Orgs from "
+              f"unseeded primary-mail domains...")
+        auto_rows = [{"canonical_name": d, "domain": d}
+                     for d in sorted(auto_domains)]
+        with driver.session() as session:
+            for i in range(0, len(auto_rows), 500):
+                session.run(AUTO_ORGS_CYPHER, rows=auto_rows[i:i + 500])
     if not rows:
         return
     print(f"Layer 2b: {len(rows)} WORKS_AT edges from domain map...")
     with driver.session() as session:
         for i in range(0, len(rows), 500):
             session.run(LOAD_WORKS_AT_CYPHER, rows=rows[i:i + 500])
+
+
+# ---------------------------------------------------------------------------
+# Layer 2c: Person identity — ALIAS_OF edges (deterministic, zero tokens)
+# ---------------------------------------------------------------------------
+#
+# One human often has several addresses (work + personal, old + new). The
+# merge used to live only in style_profiles.py's Python union-find, invisible
+# to Liam's Cypher. This layer materializes it in the graph:
+#     (alias:Person)-[:ALIAS_OF]->(canonical:Person)
+# from two deterministic signals: exact normalized-name equality (names with
+# ≥2 tokens only, so two bare "Juan"s never fuse) and the hand-edited groups
+# in data/recipient_aliases.json. Full rebuild each run (clear + recreate) —
+# idempotent, and edits to the alias file take effect on the next load.
+
+CLEAR_ALIAS_CYPHER = "MATCH ()-[r:ALIAS_OF]->() DELETE r"
+LOAD_ALIAS_CYPHER = """
+UNWIND $rows AS row
+MATCH (a:Person {email: row.email})
+MATCH (c:Person {email: row.canonical})
+MERGE (a)-[r:ALIAS_OF]->(c)
+  SET r.source = row.source
+"""
+
+
+def _norm_person_name(name: str) -> str:
+    """Lower-case, strip accents/quotes, collapse spaces — mirrors
+    style_profiles._norm_name so both mergers agree."""
+    import re
+    import unicodedata
+    s = (name or "").strip().strip("'\"").strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def load_person_aliases(driver) -> None:
+    with driver.session() as s:
+        people = s.run(
+            "MATCH (p:Person) WHERE p.email IS NOT NULL "
+            "RETURN p.email AS email, p.name AS name").data()
+    emails = {(r["email"] or "").lower() for r in people if r["email"]}
+
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    # Signal 1 — exact normalized full-name match (≥2 tokens).
+    by_name: dict[str, list[str]] = {}
+    for r in people:
+        email = (r["email"] or "").lower()
+        nk = _norm_person_name(r["name"] or "")
+        if email and nk and len(nk.split()) >= 2:
+            by_name.setdefault(nk, []).append(email)
+    for grp in by_name.values():
+        for e in grp[1:]:
+            union(grp[0], e)
+
+    # Signal 2 — the hand-edited alias file (only emails that exist as
+    # Person nodes; LOAD_ALIAS_CYPHER MATCHes would skip the rest anyway).
+    manual: set[str] = set()
+    try:
+        d = json.loads(RECIPIENT_ALIASES_PATH.read_text(encoding="utf-8"))
+        groups = (d.get("groups") if isinstance(d, dict) else None) or []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        groups = []
+    for g in groups:
+        ems = [e.strip().lower() for e in (g.get("emails") or [])
+               if isinstance(e, str) and e.strip().lower() in emails]
+        for e in ems[1:]:
+            union(ems[0], e)
+        manual.update(ems)
+
+    # Components → (alias, canonical) rows. Canonical = lexicographically
+    # smallest email (deterministic; Liam traverses ALIAS_OF undirected, so
+    # the choice of canonical is presentational).
+    comps: dict[str, list[str]] = {}
+    for e in list(parent):
+        comps.setdefault(find(e), []).append(e)
+    rows = []
+    for members in comps.values():
+        if len(members) < 2:
+            continue
+        canonical = min(members)
+        for e in members:
+            if e != canonical:
+                rows.append({"email": e, "canonical": canonical,
+                             "source": "manual" if e in manual else "name"})
+    print(f"Layer 2c: {len(rows)} ALIAS_OF edges "
+          f"({sum(1 for r in rows if r['source'] == 'manual')} from the "
+          f"alias file)...")
+    with driver.session() as s:
+        s.run(CLEAR_ALIAS_CYPHER)
+        for i in range(0, len(rows), 1000):
+            s.run(LOAD_ALIAS_CYPHER, rows=rows[i:i + 1000])
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +912,8 @@ def main() -> None:
                              "backbone). Independent of --skip-messages.")
     parser.add_argument("--skip-domain-orgs", action="store_true",
                         help="Skip Layer 2 (Org-from-domain + WORKS_AT).")
+    parser.add_argument("--skip-aliases", action="store_true",
+                        help="Skip Layer 2c (Person ALIAS_OF identity edges).")
     parser.add_argument("--skip-events", action="store_true",
                         help="Skip Layer 4 (calendar_events.jsonl).")
     parser.add_argument("--batch", type=int, default=200,
@@ -741,6 +935,8 @@ def main() -> None:
             if seed:
                 load_domain_orgs(driver, seed)
                 load_works_at(driver, seed)
+        if not args.skip_aliases:
+            load_person_aliases(driver)
         if not args.skip_events:
             load_events(driver, args.batch)
     finally:

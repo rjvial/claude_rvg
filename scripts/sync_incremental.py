@@ -143,7 +143,8 @@ def apply_read_changes(label: str, became_read: set[str],
                     MATCH (m:Message {gmail_message_id: mid,
                                       account_owner: $acct})
                     WHERE 'UNREAD' IN coalesce(m.label_ids, [])
-                    SET m.label_ids = [x IN m.label_ids WHERE x <> 'UNREAD']
+                    SET m.label_ids = [x IN m.label_ids WHERE x <> 'UNREAD'],
+                        m.rev = timestamp()
                 """, mids=list(became_read), acct=label).consume()
                 changed += res.counters.properties_set
             if became_unread:
@@ -152,7 +153,8 @@ def apply_read_changes(label: str, became_read: set[str],
                     MATCH (m:Message {gmail_message_id: mid,
                                       account_owner: $acct})
                     WHERE NOT 'UNREAD' IN coalesce(m.label_ids, [])
-                    SET m.label_ids = coalesce(m.label_ids, []) + 'UNREAD'
+                    SET m.label_ids = coalesce(m.label_ids, []) + 'UNREAD',
+                        m.rev = timestamp()
                 """, mids=list(became_unread), acct=label).consume()
                 changed += res.counters.properties_set
     finally:
@@ -193,7 +195,8 @@ def apply_spam_changes(label: str, became_spam: set[str],
                             ELSE 'primary' END,
                         m.label_ids =
                         [x IN m.label_ids
-                           WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'INBOX'
+                           WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'INBOX',
+                        m.rev = timestamp()
                 """, mids=list(became_not_spam), acct=label).consume()
                 changed += res.counters.properties_set
             if became_spam:
@@ -205,7 +208,8 @@ def apply_spam_changes(label: str, became_spam: set[str],
                     SET m.bucket = 'spam',
                         m.label_ids =
                         [x IN coalesce(m.label_ids, [])
-                           WHERE x <> 'INBOX'] + 'SPAM'
+                           WHERE x <> 'INBOX'] + 'SPAM',
+                        m.rev = timestamp()
                 """, mids=list(became_spam), acct=label).consume()
                 changed += res.counters.properties_set
     finally:

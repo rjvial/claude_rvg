@@ -693,8 +693,19 @@ ASK_SYSTEM = (
     "\n      ORDER BY score DESC LIMIT 10"
     "\n  (c) Then fetch the bodies of the hits you care about (pattern a) "
     "before drawing conclusions."
+    "\n  (d) Resolve PEOPLE through the accent-folding person_name full-text "
+    "index — not by scanning bodies:"
+    "\n      CALL db.index.fulltext.queryNodes('person_name', 'munoz') "
+    "YIELD node RETURN node.email, node.name"
     "\nNode labels: Message, Person, Org, Thread, Matter, Event. "
     "Never modify the graph."
+    "\nRETURN individual PROPERTIES, never a whole node (RETURN m.subject, "
+    "not RETURN m): Message nodes carry a 1024-float embedding that would "
+    "flood your context."
+    "\nEvery Message has BOTH m.sent_at (ISO string, sorts lexicographically) "
+    "and m.sent_dt (native datetime) — prefer m.sent_dt for date arithmetic, "
+    "e.g. WHERE m.sent_dt >= datetime('2024-01-01') or "
+    "date.truncate('month', m.sent_dt)."
     "\n\nBREADTH, TIMELINE & ENUMERATION QUESTIONS. When the question asks for "
     "a span ('history', 'evolution', 'a lo largo de los años', 'desde el "
     "principio'), for the WHOLE ARC of a person or matter ('qué pasó con X', "
@@ -712,7 +723,11 @@ ASK_SYSTEM = (
     "\n     then match its people by address — both directions — e.g. "
     "(p:Person)-[:SENT]->(m) and (m)-[:RECEIVED_BY]->(p) WHERE p.email ENDS "
     "WITH '@'+domain. For a PERSON, first find their address(es) (one human "
-    "may have several); a first name alone is ambiguous, so confirm identity "
+    "may have several): the graph links addresses of the same human with "
+    "(alias:Person)-[:ALIAS_OF]->(canonical:Person) edges (deterministic "
+    "name/alias merge) — after finding one address, ALWAYS expand "
+    "(p)-[:ALIAS_OF*0..1]-(same:Person) and query mail across ALL of that "
+    "person's addresses. A first name alone is ambiguous, so confirm identity "
     "by email / RUT before attributing anything to them, and keep look-alikes "
     "apart (e.g. a parent vs a child with similar names)."
     "\n  1b. WITH the person vs ABOUT the person — RUN BOTH. The arc of a "
@@ -1023,36 +1038,112 @@ _srv = None
 _rebuild_lock = threading.Lock()
 
 
-def rebuild() -> None:
-    """Re-query Neo4j, refresh the cached HTML + its gzipped form, and bring
-    the body store up to date with emails.jsonl."""
+# Retained graph model behind the incremental rebuild: the last full fetch's
+# (messages, edges, people) plus the m.rev watermark it is current to, and a
+# (acct, mid) → elementId map for evicting trashed messages. Guarded by
+# _rebuild_lock. Costs ~100-200 MB resident for a ~47k-message graph — the
+# price of turning every post-sync rebuild from a full multi-second re-read
+# of the whole graph into one indexed "changed since $rev" query.
+_model: dict | None = None
+
+
+def rebuild(removed: set[tuple[str, str]] | None = None) -> None:
+    """Refresh the cached HTML + its gzipped form, and bring the body store up
+    to date with emails.jsonl. Incremental: only messages whose m.rev is newer
+    than the retained model's watermark are re-read from Neo4j (every create/
+    label-flip path stamps m.rev). `removed` — (acct, mid) keys the caller
+    just deleted — is evicted from the model directly; any drift we weren't
+    told about is caught by a count check that forces a full refetch."""
     with _rebuild_lock:
-        _rebuild_locked()
+        _rebuild_locked(removed)
 
 
-def _rebuild_locked() -> None:
+def _load_full_model(drv, watermark: int) -> dict:
+    import graph_app
+    messages, edges, people, _ = graph_app.fetch(drv, lean=True)
+    return {
+        "messages": messages,
+        "edges": set(edges),
+        "people": people,
+        "rev": watermark,
+        "key2eid": {(m["acct"], m["mid"]): eid
+                    for eid, m in messages.items()},
+    }
+
+
+def _rebuild_locked(removed: set[tuple[str, str]] | None = None) -> None:
+    global _model
     import body_store
     added = body_store.refresh()
     if added:
         print(f"[serve] body store +{added:,} rows "
               f"(total {body_store.count():,})")
     import graph_app
+    import hashlib
+    page_hash = hashlib.md5(graph_app.PAGE.encode("utf-8")).hexdigest()
     drv = graph_app.driver()
     try:
+        with drv.session() as s:
+            # Watermark BEFORE the fetch: anything stamped after it is
+            # (re-)fetched next time too — duplicates patch idempotently,
+            # so the window can't lose changes.
+            watermark = s.execute_read(
+                lambda tx: tx.run("RETURN timestamp() AS ts").single()["ts"])
+        if _model is None:
+            _model = _load_full_model(drv, watermark)
+        else:
+            if removed:
+                for key in removed:
+                    eid = _model["key2eid"].pop(key, None)
+                    if eid:
+                        _model["messages"].pop(eid, None)
+                live = _model["messages"]
+                _model["edges"] = {e for e in _model["edges"]
+                                   if e[0] in live and e[1] in live}
+            d_msgs, d_edges, d_people = graph_app.fetch_changed(
+                drv, _model["rev"])
+            for eid, m in d_msgs.items():
+                _model["messages"][eid] = m
+                _model["key2eid"][(m["acct"], m["mid"])] = eid
+            _model["edges"].update(d_edges)
+            _model["people"].update(d_people)
+            _model["rev"] = watermark
+            if d_msgs:
+                print(f"[serve] rebuild: {len(d_msgs):,} changed message(s) "
+                      f"patched incrementally")
+            # Drift check (count store — O(1)): deletions we weren't told
+            # about (account purge, external cleanup) force a full refetch.
+            with drv.session() as s:
+                n = s.execute_read(lambda tx: tx.run(
+                    "MATCH (m:Message) RETURN count(m) AS n").single()["n"])
+            drifted = n != len(_model["messages"])
+            if drifted:
+                print(f"[serve] rebuild: count drift (graph {n:,} vs model "
+                      f"{len(_model['messages']):,}) — full refetch")
+                _model = _load_full_model(drv, watermark)
+            elif not d_msgs and not removed:
+                # Nothing changed at all — skip the assemble + serialize
+                # entirely (the common every-10-minutes no-new-mail sync).
+                # page_hash guards the case where the CODE changed but the
+                # data didn't: a template change must still re-render.
+                with _lock:
+                    if (_state["version"] > 0
+                            and _state.get("page_hash") == page_hash):
+                        print(f"[serve] rebuild: no change "
+                              f"(version {_state['version']})")
+                        return
         # lean=True drops body_clean from every message — the panel falls
         # back to the snippet on open and /api/body upgrades to the real
-        # HTML on click. Cuts the rendered page from ~100 MB to ~5 MB.
-        # build_payload takes the driver and parallelises its 4 Cypher
-        # queries internally.
-        payload = graph_app.build_payload(drv, lean=True)
+        # HTML on click. Keeps the rendered page ~5 MB instead of ~100 MB.
+        payload = graph_app.assemble_payload(
+            _model["messages"], _model["edges"], _model["people"], lean=True)
     finally:
         drv.close()
     payload_json = json.dumps(payload, ensure_ascii=False)
-    # Fingerprint the render template so a code/template change forces a re-render
-    # even when the data is unchanged (otherwise the no-op fast path below would
-    # keep serving a page rendered by old code after an upgrade + restart).
-    import hashlib
-    page_hash = hashlib.md5(graph_app.PAGE.encode("utf-8")).hexdigest()
+    # page_hash (computed above) fingerprints the render template so a code/
+    # template change forces a re-render even when the data is unchanged
+    # (otherwise the no-op fast path below would keep serving a page rendered
+    # by old code after an upgrade + restart).
     # No-op fast path: if the rebuilt data AND the template are byte-identical to
     # what's already cached, don't bump the version. This happens when a periodic
     # sync pulls no new mail. Skipping the bump avoids a spurious "new data,
@@ -1544,15 +1635,23 @@ def _purge_account(label: str) -> None:
               f"{type(e).__name__}: {e}")
 
 
+def _read_tx(session, query: str, **params) -> list[dict]:
+    """One managed READ transaction returning .data() rows. Unlike bare
+    session.run() (auto-commit, no retry), execute_read retries transient
+    failures — e.g. Neo4j still settling right after the app launched it."""
+    return session.execute_read(lambda tx: tx.run(query, **params).data())
+
+
 def _known_emails() -> list[str]:
     """All Person.email values in the graph — used for composer autocomplete."""
     import graph_app
     drv = graph_app.driver()
     try:
         with drv.session() as s:
-            rows = s.run(
+            rows = _read_tx(
+                s,
                 "MATCH (p:Person) WHERE p.email IS NOT NULL "
-                "RETURN p.email AS e, p.name AS n").data()
+                "RETURN p.email AS e, p.name AS n")
     finally:
         drv.close()
     # Stable, name-first ordering when both exist; emails alone fall back to
@@ -1630,7 +1729,8 @@ def _body_search(term: str) -> list[list[str]]:
                 lucene = _re.sub(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)',
                                  r"\\\1", term) + "*"
             try:
-                rows = s.run(
+                rows = _read_tx(
+                    s,
                     "CALL db.index.fulltext.queryNodes('message_text', $q) "
                     "YIELD node AS m "
                     "WHERE m.body_clean IS NOT NULL "
@@ -1638,17 +1738,18 @@ def _body_search(term: str) -> list[list[str]]:
                     "RETURN m.gmail_message_id AS mid, "
                     "       m.account_owner AS acct "
                     "LIMIT 20000",
-                    q=lucene, raw=term).data()
+                    q=lucene, raw=term)
             except Exception:
                 # Index missing (setup not run) — fall back to the full scan.
-                rows = s.run(
+                rows = _read_tx(
+                    s,
                     "MATCH (m:Message) "
                     "WHERE m.body_clean IS NOT NULL "
                     "  AND toLower(m.body_clean) CONTAINS $q "
                     "RETURN m.gmail_message_id AS mid, "
                     "       m.account_owner AS acct "
                     "LIMIT 20000",
-                    q=term).data()
+                    q=term)
     finally:
         drv.close()
     return [[r["mid"], r["acct"]] for r in rows]
@@ -1663,36 +1764,29 @@ def _fetch_quote(mid: str, acct: str) -> dict | None:
     drv = graph_app.driver()
     try:
         with drv.session() as s:
-            row = s.run(
+            rows = _read_tx(
+                s,
                 "MATCH (m:Message {gmail_message_id:$mid, account_owner:$acct}) "
                 "OPTIONAL MATCH (sender:Person)-[:SENT]->(m) "
+                "OPTIONAL MATCH (m)-[:IN_THREAD]->(t:Thread) "
                 "OPTIONAL MATCH (m)-[r:RECEIVED_BY]->(rcpt:Person) "
-                "WITH m, sender, "
+                "WITH m, sender, t, "
                 "     collect(DISTINCT CASE WHEN r.kind='to' THEN rcpt.email END) AS too, "
                 "     collect(DISTINCT CASE WHEN r.kind='cc' THEN rcpt.email END) AS ccc "
                 "RETURN m.subject AS subject, m.sent_at AS sent_at, "
                 "       m.body_clean AS body, m.rfc822_message_id AS rfc822, "
                 "       m.references AS refs, m.gmail_message_id AS gmid, "
                 "       m.account_owner AS acct, "
+                "       t.gmail_thread_id AS tid, "
                 "       sender.email AS from_email, sender.name AS from_name, "
                 "       [x IN too WHERE x IS NOT NULL] AS too, "
                 "       [x IN ccc WHERE x IS NOT NULL] AS ccc",
-                mid=mid, acct=acct).single()
+                mid=mid, acct=acct)
     finally:
         drv.close()
+    row = rows[0] if rows else None
     if not row:
         return None
-    # Thread id is needed by the client to keep the reply in the same Gmail
-    # conversation — pull it via the IN_THREAD relationship.
-    drv = graph_app.driver()
-    try:
-        with drv.session() as s:
-            tid_row = s.run(
-                "MATCH (m:Message {gmail_message_id:$mid, account_owner:$acct})"
-                "-[:IN_THREAD]->(t:Thread) RETURN t.gmail_thread_id AS tid",
-                mid=mid, acct=acct).single()
-    finally:
-        drv.close()
     # The graph stores body_clean only; the raw HTML lives in emails.jsonl
     # (indexed by body_store). Pull it so the composer can render a real
     # quoted message on reply/forward instead of stripped plain text.
@@ -1713,7 +1807,7 @@ def _fetch_quote(mid: str, acct: str) -> dict | None:
         "body_html":  body_html,
         "rfc822":     row["rfc822"] or "",
         "references": row["refs"] or [],
-        "thread_id":  (tid_row["tid"] if tid_row else "") or "",
+        "thread_id":  row["tid"] or "",
     }
 
 
@@ -1742,14 +1836,16 @@ def _fetch_attachment(mid: str, acct: str, part: str) -> tuple[bytes, str, str]:
     drv = graph_app.driver()
     try:
         with drv.session() as s:
-            row = s.run(
+            rows = _read_tx(
+                s,
                 "MATCH (m:Message {gmail_message_id:$mid, account_owner:$acct})"
                 "-[:HAS_ATTACHMENT]->(a:Attachment {part_id:$part}) "
                 "RETURN a.attachment_id AS aid, a.filename AS fn, "
                 "       a.mime_type AS mime",
-                mid=mid, acct=acct, part=part).single()
+                mid=mid, acct=acct, part=part)
     finally:
         drv.close()
+    row = rows[0] if rows else None
     if not row:
         raise FileNotFoundError("attachment not found in graph")
     filename = row["fn"] or "attachment"
@@ -2141,11 +2237,10 @@ def _do_compose_draft(payload: dict) -> dict:
 # --- trash: move messages to Gmail Trash + purge local mirror ------------
 
 def _purge_neo4j(trashed: set[tuple[str, str]]) -> None:
-    """Fast path: detach-delete the Message + its Attachment(s). This is what
-    callers need before responding to the client so the graph is consistent
-    with what the user just clicked. Orphan-thread cleanup is deferred to the
-    background sweep below — it scans every Thread node and isn't worth
-    making the client wait for."""
+    """Fast path: detach-delete the Message + its Attachment(s), then drop
+    only the Threads THESE messages belonged to if they are now empty — a
+    targeted check on a handful of threads, not a scan of every Thread node
+    (which is what the old deferred background sweep did on every trash)."""
     if not trashed:
         return
     import graph_app
@@ -2157,8 +2252,16 @@ def _purge_neo4j(trashed: set[tuple[str, str]]) -> None:
                 UNWIND $rows AS row
                 MATCH (m:Message {gmail_message_id: row.mid,
                                   account_owner: row.acct})
+                OPTIONAL MATCH (m)-[:IN_THREAD]->(t:Thread)
                 OPTIONAL MATCH (m)-[:HAS_ATTACHMENT]->(a:Attachment)
-                DETACH DELETE a, m
+                WITH collect(DISTINCT m) AS msgs, collect(DISTINCT a) AS atts,
+                     collect(DISTINCT t) AS thrs
+                FOREACH (x IN atts | DETACH DELETE x)
+                FOREACH (x IN msgs | DETACH DELETE x)
+                WITH thrs
+                UNWIND thrs AS t
+                WITH t WHERE NOT (t)<-[:IN_THREAD]-(:Message)
+                DETACH DELETE t
             """, rows=rows).consume()
     finally:
         drv.close()
@@ -2179,7 +2282,8 @@ def _clear_unread_neo4j(read: set[tuple[str, str]]) -> None:
                 MATCH (m:Message {gmail_message_id: row.mid,
                                   account_owner: row.acct})
                 SET m.label_ids =
-                    [x IN coalesce(m.label_ids, []) WHERE x <> 'UNREAD']
+                    [x IN coalesce(m.label_ids, []) WHERE x <> 'UNREAD'],
+                    m.rev = timestamp()
             """, rows=rows).consume()
     finally:
         drv.close()
@@ -2209,7 +2313,8 @@ def _clear_spam_neo4j(unspammed: set[tuple[str, str]]) -> None:
                         ELSE 'primary' END,
                     m.label_ids =
                     [x IN coalesce(m.label_ids, [])
-                       WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'INBOX'
+                       WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'INBOX',
+                    m.rev = timestamp()
             """, rows=rows).consume()
     finally:
         drv.close()
@@ -2234,7 +2339,8 @@ def _set_spam_neo4j(spammed: set[tuple[str, str]]) -> None:
                 SET m.bucket = 'spam',
                     m.label_ids =
                     [x IN coalesce(m.label_ids, [])
-                       WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'SPAM'
+                       WHERE x <> 'SPAM' AND x <> 'INBOX'] + 'SPAM',
+                    m.rev = timestamp()
             """, rows=rows).consume()
     finally:
         drv.close()
@@ -2305,24 +2411,15 @@ def _purge_files_and_rebuild(trashed: set[tuple[str, str]]) -> None:
                 p.write_text("\n".join(kept) + ("\n" if kept else ""),
                              encoding="utf-8")
 
-        # Orphan-thread sweep — Threads whose only Messages were just deleted.
-        import graph_app
-        drv = graph_app.driver()
-        try:
-            with drv.session() as session:
-                session.run("""
-                    MATCH (t:Thread)
-                    WHERE NOT (t)<-[:IN_THREAD]-(:Message)
-                    DETACH DELETE t
-                """).consume()
-        finally:
-            drv.close()
+        # Orphan-thread cleanup now happens inline in _purge_neo4j (targeted
+        # to the trashed messages' own threads) — no full-Thread scan here.
 
         # Final step: rebuild the page cache so a full reload sees the
         # deletions. The client also tracks deletions locally (REMOVED set)
         # for instant visual feedback, but the cache must catch up so new
-        # tabs / reloads don't show stale rows.
-        rebuild()
+        # tabs / reloads don't show stale rows. Passing the trashed keys
+        # lets the incremental model evict them without a full refetch.
+        rebuild(removed=trashed)
     except Exception as e:
         print(f"[serve] background trash cleanup failed: "
               f"{type(e).__name__}: {e}")

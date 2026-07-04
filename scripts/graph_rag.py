@@ -4,10 +4,12 @@ The unit of retrieval is the CONVERSATION, not the message. An answer about a
 matter's status or history needs its whole arc — not a handful of
 keyword-matched replies — so:
 
-  1. Semantic — embed the question and vector-search the message_embedding
-     index for a pool of candidate messages. Candidates are grouped by
-     conversation (Matter if the thread has one, else Thread), and the
-     conversations are ranked by their best-matching messages.
+  1. Hybrid — embed the question and vector-search the message_embedding
+     index, AND keyword-search the message_text full-text index; the two
+     candidate lists are fused by reciprocal rank (exact names/identifiers
+     that don't embed near the question still surface). Candidates are
+     grouped by conversation (Matter if the thread has one, else Thread),
+     and the conversations are ranked by their best-matching messages.
   2. Conversation-complete — the top few conversations are pulled WHOLE:
      every message, in chronological order, with its body, sender, Orgs and
      attachment names.
@@ -44,6 +46,8 @@ from embed_messages import MODEL_NAME, hf_offline_if_cached  # noqa: E402
 
 VECTOR_INDEX = "message_embedding"
 CANDIDATE_POOL = 150         # vector hits scanned to locate relevant conversations
+FULLTEXT_POOL = 50           # keyword hits fused in alongside the vector pool
+RRF_K = 60                   # reciprocal-rank-fusion damping constant
 MAX_CONVERSATIONS = 10       # conversations considered for the bundle
 CONV_SCORE_TOP = 3           # extra hits (beyond the best) that nudge the score
 TOTAL_BUDGET = 120_000       # total body chars across the whole bundle
@@ -90,6 +94,35 @@ RETURN m.gmail_message_id AS mid, m.account_owner AS acct, score,
        elementId(mt) AS matter_eid, elementId(t) AS thread_eid
 ORDER BY score DESC
 """
+
+# Keyword leg of the hybrid retriever: the accent-folding full-text index
+# catches exact tokens (names, identifiers, invoice numbers) that don't embed
+# close to the question. Filtered to primary like the vector leg (only primary
+# mail is embedded, so the bundle contract stays: lite never appears).
+FULLTEXT_CANDIDATES_CYPHER = """
+CALL db.index.fulltext.queryNodes('message_text', $q)
+     YIELD node AS m, score
+WHERE coalesce(m.bucket, 'primary') = 'primary'
+OPTIONAL MATCH (m)-[:IN_THREAD]->(t:Thread)
+OPTIONAL MATCH (t)-[:PART_OF]->(mt:Matter)
+RETURN m.gmail_message_id AS mid, m.account_owner AS acct, score,
+       elementId(mt) AS matter_eid, elementId(t) AS thread_eid
+ORDER BY score DESC
+LIMIT $k
+"""
+
+
+def _lucene_query(question: str, max_terms: int = 12) -> str:
+    """OR-of-escaped-tokens Lucene query from the question (tokens ≥3 chars,
+    deduped, capped). Lucene's idf keeps common words from dominating."""
+    import re
+    toks: list[str] = []
+    for t in re.findall(r"\w{3,}", (question or "").lower()):
+        if t not in toks:
+            toks.append(t)
+    esc = [re.sub(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)', r"\\\1", t)
+           for t in toks[:max_terms]]
+    return " OR ".join(esc)
 
 # Stage 2 — pull a whole conversation. Three anchors (Matter / Thread / lone
 # Message) share the same expansion tail: sender + Orgs + attachments per
@@ -165,10 +198,42 @@ def retrieve(session, question: str,
         {kind, label, score, messages: [<every message, chronological>]}
     Each message carries `hit` / `score` flagging whether it matched the
     query. build_context() turns this into the prompt bundle."""
+    # execute_read = managed transactions with driver-level retry on
+    # transient failures, vs bare session.run which fails them through.
+    def _read(q, **params):
+        return session.execute_read(lambda tx: tx.run(q, **params).data())
+
     qvec = embed_query(question)
-    candidates = [dict(r) for r in session.run(
-        CANDIDATES_CYPHER, index=VECTOR_INDEX, candidates=CANDIDATE_POOL,
-        qvec=qvec)]
+    vec_rows = _read(CANDIDATES_CYPHER, index=VECTOR_INDEX,
+                     candidates=CANDIDATE_POOL, qvec=qvec)
+    ft_rows: list[dict] = []
+    lucene = _lucene_query(question)
+    if lucene:
+        try:
+            ft_rows = _read(FULLTEXT_CANDIDATES_CYPHER,
+                            q=lucene, k=FULLTEXT_POOL)
+        except Exception:
+            ft_rows = []          # index missing / bad query — vector-only
+
+    # Reciprocal-rank fusion: cosine and Lucene scores live on different
+    # scales, so fuse by RANK. A message found by both legs outranks one
+    # found by either alone; a keyword-only hit (exact name/identifier the
+    # embedding missed) still enters the pool.
+    fused: dict[tuple, dict] = {}
+
+    def _absorb(rows: list[dict]) -> None:
+        for rank, c in enumerate(rows):
+            key = (c["mid"], c["acct"])
+            e = fused.get(key)
+            if e is None:
+                e = dict(c)
+                e["score"] = 0.0
+                fused[key] = e
+            e["score"] += 1.0 / (RRF_K + rank + 1)
+
+    _absorb(vec_rows)
+    _absorb(ft_rows)
+    candidates = sorted(fused.values(), key=lambda c: -c["score"])
     if not candidates:
         return []
 
@@ -194,12 +259,11 @@ def retrieve(session, question: str,
     out: list[dict] = []
     for g in ranked:
         if g["kind"] == "matter":
-            rows = session.run(MATTER_MESSAGES_CYPHER, eid=g["meid"])
+            msgs = _read(MATTER_MESSAGES_CYPHER, eid=g["meid"])
         elif g["kind"] == "thread":
-            rows = session.run(THREAD_MESSAGES_CYPHER, eid=g["teid"])
+            msgs = _read(THREAD_MESSAGES_CYPHER, eid=g["teid"])
         else:
-            rows = session.run(MESSAGE_CYPHER, mid=g["mid"], acct=g["acct"])
-        msgs = [dict(r) for r in rows]
+            msgs = _read(MESSAGE_CYPHER, mid=g["mid"], acct=g["acct"])
         if not msgs:
             continue
         for m in msgs:

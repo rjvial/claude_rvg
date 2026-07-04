@@ -50,9 +50,9 @@ Orchestrator runs: pre-flight (venv, OAuth, Neo4j reachable over Bolt) → prelo
 **Nodes** (key in parens):
 
 * `Person` (`email`) — `name`
-* `Org` (`canonical\\\_name`) — `domain?`, `aliases\\\[]` (email-domain derived only)
+* `Org` (`canonical\\\_name`) — `domain?`, `aliases\\\[]`, `source?` (`auto\\\_domain` for Orgs auto-derived from unseeded primary-mail sender domains; seeded ones come from `orgs\\\_seed.json`)
 * `Thread` (compound: `gmail\\\_thread\\\_id` + `account\\\_owner`)
-* `Message` (compound: `gmail\\\_message\\\_id` + `account\\\_owner`) — `sent\\\_at`, `body\\\_clean`, `embedding`
+* `Message` (compound: `gmail\\\_message\\\_id` + `account\\\_owner`) — `sent\\\_at` (ISO string), `sent\\\_dt` (native datetime twin), `from\\\_name`, `body\\\_clean`, `embedding`, `rev` (ms revision marker: stamped on create and on every label/spam mutation; backs serve\\\_app's incremental cache rebuild)
 * `Attachment` (compound: `gmail\\\_message\\\_id` + `account\\\_owner` + `part\\\_id`)
 * `Event` — calendar events, deduped on `(ical\\\_uid, start)`
 * `Matter` (`canonical\\\_key`) — multi-thread unification node from `cluster\\\_matters.py`
@@ -60,13 +60,14 @@ Orchestrator runs: pre-flight (venv, OAuth, Neo4j reachable over Bolt) → prelo
 **Relationships:**
 
 * `Person -\\\[:SENT]-> Message`, `Message -\\\[:RECEIVED\\\_BY {kind}]-> Person`
+* `Person -\\\[:ALIAS\\\_OF {source}]-> Person` — addresses of the same human (deterministic: exact normalized-name match with ≥2 tokens, plus `data/recipient\\\_aliases.json`); rebuilt on every `load\\\_neo4j.py` run (Layer 2c)
 * `Message -\\\[:IN\\\_THREAD {seq}]-> Thread`, `Thread -\\\[:PART\\\_OF]-> Matter`
 * `Message -\\\[:HAS\\\_ATTACHMENT]-> Attachment`
 * `Message -\\\[:REPLY\\\_TO]-> Message`, `Message -\\\[:NEXT\\\_IN\\\_THREAD]-> Message`, `Thread -\\\[:STARTS\\\_WITH]-> Message`
-* `Person -\\\[:WORKS\\\_AT]-> Org` (from email domain via `orgs\\\_seed.json`)
+* `Person -\\\[:WORKS\\\_AT]-> Org` (from email domain via `orgs\\\_seed.json` + auto-orgs)
 * `Event -\\\[:ORGANIZED]-> Person`, `Event -\\\[:INVITED]-> Person`
 
-Vector index on `Message.embedding` (1024-dim, cosine) for graph-RAG. Full-text index over subject + body\_clean.
+Vector index on `Message.embedding` (1024-dim, cosine) for graph-RAG; retrieval is hybrid (vector + `message\\\_text` full-text, fused by reciprocal rank). Full-text indexes: `message\\\_text` (subject + body\\\_clean) and `person\\\_name` (Person.name), both accent-folding.
 
 ## Data layout
 
