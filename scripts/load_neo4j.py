@@ -146,7 +146,14 @@ MERGE (m:Message {gmail_message_id: row.message_id, account_owner: row.account_o
     m.gmail_url = row.gmail_url,
     m.rfc822_message_id = row.rfc822_message_id,
     m.in_reply_to = row.in_reply_to,
-    m.references = row.references
+    m.references = row.references,
+    // Per-message sender display name. Stored on the Message (not just the
+    // sender Person) because Person is keyed by email alone, so senders that
+    // share one address but vary the display name — e.g. every Docusign
+    // notification comes from dse_*@docusign.net under a different human's
+    // name — collapse into one Person and would otherwise all render with
+    // whichever name won. m.from_name keeps each message's true sender.
+    m.from_name = row.from_name
   ON MATCH SET
     // gmail_url is derived from ids; always refresh to the latest form
     // (e.g. promote thread-anchored URLs to per-message rfc822msgid: URLs
@@ -159,7 +166,10 @@ MERGE (m:Message {gmail_message_id: row.message_id, account_owner: row.account_o
     m.rfc822_message_id = coalesce(m.rfc822_message_id, row.rfc822_message_id),
     m.in_reply_to = coalesce(m.in_reply_to, row.in_reply_to),
     m.references = CASE WHEN m.references IS NULL OR size(m.references) = 0
-                        THEN row.references ELSE m.references END
+                        THEN row.references ELSE m.references END,
+    // Backfill legacy nodes that predate m.from_name; never null out a value
+    // already present if a re-pulled row happens to lack the name.
+    m.from_name = coalesce(row.from_name, m.from_name)
 MERGE (m)-[:IN_THREAD]->(t)
 WITH m, row
 WHERE row.from_email IS NOT NULL

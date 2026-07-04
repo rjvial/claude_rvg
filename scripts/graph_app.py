@@ -53,7 +53,7 @@ RETURN elementId(m) AS eid, m.subject AS subject, m.sent_at AS sent_at,
        m.snippet AS snippet, m.body_clean AS body, m.gmail_url AS gmail_url,
        m.rfc822_message_id AS rfc822, m.account_owner AS acct,
        m.gmail_message_id AS mid, t.gmail_thread_id AS tid,
-       m.label_ids AS labels, m.bucket AS bucket
+       m.label_ids AS labels, m.bucket AS bucket, m.from_name AS from_name
 """
 ALL_EDGES_CYPHER = """
 MATCH (a:Message)-[r:REPLY_TO|NEXT_IN_THREAD]->(b:Message)
@@ -137,6 +137,7 @@ def fetch(driver, lean: bool = False) -> tuple[dict, list, dict, dict]:
             "snippet": r["snippet"], "body": r["body"],
             "gmail_url": r["gmail_url"], "rfc822": r["rfc822"],
             "acct": r["acct"], "tid": r["tid"], "mid": r["mid"],
+            "from_name": r["from_name"],
             "unread": "UNREAD" in (r["labels"] or []),
             "spam": "SPAM" in (r["labels"] or []),
             # Treatment tier. Prefer the stored m.bucket; fall back to deriving
@@ -249,7 +250,11 @@ def build_payload(driver, lean: bool = False) -> dict:
             "par": idx[parent_of[eid]] if parent_of.get(eid) in idx else -1,
             "kind": kind_of(eid),
             "from": snd,
-            "name": people.get(snd, ""),
+            # Prefer this message's own sender name over the email-keyed
+            # Person.name: addresses reused under many display names (Docusign,
+            # no-reply@…, ticketing bots) share one Person, so people.get(snd)
+            # would label every such message with a single arbitrary name.
+            "name": m.get("from_name") or people.get(snd, ""),
             "subj": m["subject"] or "(no subject)",
             "snip": snippet[:240],
             "sent": m["sent_at"],
