@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import webbrowser
 from pathlib import Path
 
@@ -163,9 +164,43 @@ def fetch(driver, lean: bool = False) -> tuple[dict, list, dict, dict]:
     return messages, edges, people, {}
 
 
+class _SharedDriver:
+    """Process-lifetime Neo4j driver behind the graph_app.driver() contract.
+
+    Every serve_app handler does `drv = graph_app.driver() … drv.close()`.
+    Building a real driver per request throws away the connection pool the
+    driver exists to provide — each request paid a fresh Bolt connect + auth
+    handshake (plus a dotenv re-read), and /api/quote paid it twice. This
+    wrapper shares ONE real driver and makes close() a no-op, so existing
+    call sites keep working unchanged while connections are actually reused.
+    """
+    _real = None
+    _lock = threading.Lock()
+
+    def _driver(self):
+        if _SharedDriver._real is None:
+            with _SharedDriver._lock:
+                if _SharedDriver._real is None:
+                    _SharedDriver._real = neo4j_driver()
+        return _SharedDriver._real
+
+    def session(self, **kw):
+        return self._driver().session(**kw)
+
+    def execute_query(self, *a, **kw):
+        return self._driver().execute_query(*a, **kw)
+
+    def verify_connectivity(self, **kw):
+        return self._driver().verify_connectivity(**kw)
+
+    def close(self):
+        pass                       # shared — lives for the whole process
+
+
 def driver():
-    """Neo4j driver from data/.env, then .env, then the environment."""
-    return neo4j_driver()
+    """A shared, pooled Neo4j driver (from data/.env, then .env, then the
+    environment). close() is a no-op — see _SharedDriver."""
+    return _SharedDriver()
 
 
 def build_payload(driver, lean: bool = False) -> dict:
@@ -733,6 +768,9 @@ PAGE = r"""<!DOCTYPE html>
     border:1px solid var(--line);color:var(--ink);
     border-bottom-left-radius:3px}
   .askmsg.bot a{color:var(--accent-deep);word-break:break-all}
+  .askmsg.bot code{font-family:ui-monospace,Consolas,monospace;
+    font-size:11px;background:var(--bg);border:1px solid var(--line);
+    border-radius:4px;padding:0 3px}
   .askmsg.intro{align-self:stretch;max-width:none;background:transparent;
     color:var(--ink-3);font-style:italic;padding:2px 0}
   .askmsg.thinking{color:var(--ink-3)}
@@ -1593,7 +1631,10 @@ function bodyTermMatch(m, h, v){
 }
 // Debounced so a word typed into the body box triggers one server scan on the
 // settled term, not one per keystroke (debounce() is hoisted, defined below).
-const _ensureBody = debounce(ensureBodyHits, 250);
+// 600ms (vs the filters' 80ms) so intermediate prefixes of a word being typed
+// ("mee", "meet", "meeti") don't each fire — and each permanently cache — a
+// server-side body query; the snippet fallback keeps the list live meanwhile.
+const _ensureBody = debounce(ensureBodyHits, 600);
 
 // Highlight terms per displayed column. Free terms (no field:) match every
 // column; field-scoped terms (subject:, from:, …) and the per-column filter
@@ -3016,7 +3057,23 @@ function renderAnswer(text, sources, q){
   // underneath. A stray URL is still linkified, defensively.
   const byN = {};
   (sources || []).forEach(s => { byN[s.n] = s; });
-  let html = askEscText(text || "(no answer)").replace(
+  let html = askEscText(text || "(no answer)");
+  // Lightweight markdown prettify. claude -p answers arrive as markdown, and
+  // the bubble renders pre-wrap text — without this the user reads literal
+  // "##", "**…**" and backticks in every substantive answer. Line structure
+  // is kept (pre-wrap does the layout); only the markers are transformed.
+  html = html.split("\n").map(line => {
+    let m = line.match(/^\s{0,3}#{1,4}\s+(.*)$/);
+    if(m) return "<b>" + m[1] + "</b>";
+    m = line.match(/^(\s*)[-*]\s+(.*)$/);          // bullet marker → •
+    if(m) return m[1] + "• " + m[2];
+    if(/^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{0,}:?\s*\|?\s*$/.test(line))
+      return null;                                  // |---|---| separator row
+    return line;
+  }).filter(l => l !== null).join("\n")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  html = html.replace(
     /(https?:\/\/[^\s<]+)/g,
     '<a href="$1" target="_blank" rel="noopener">$1</a>');
   const cited = [];

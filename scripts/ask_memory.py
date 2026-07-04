@@ -44,6 +44,12 @@ _SCOPES = ("ask", "compose")
 _LOCK = threading.RLock()
 _MAX_FACTS_INJECTED = 6
 _DUP_SIM = 0.92          # cosine ≥ this between two facts ⇒ duplicate, skip
+# Every style memory in a scope is injected into EVERY prompt, and auto-learn
+# can add up to 3 per turn — unbounded, weeks of use accumulate dozens of
+# (often mutually contradictory) rules that degrade answers. Cap the set;
+# when it overflows, the oldest AUTO-learned rules are dropped first (rules
+# the user typed in by hand are never auto-pruned).
+_MAX_STYLE = 20
 
 
 # ── store ──────────────────────────────────────────────────────────────────
@@ -125,6 +131,21 @@ def add(text: str, kind: str, source: str = "user",
         if vec is not None:
             entry["vec"] = vec
         d["memories"].append(entry)
+        # Enforce the style cap (see _MAX_STYLE): drop the oldest auto-learned
+        # style rules until the scope fits. List order is insertion order.
+        n_style = sum(1 for m in d["memories"] if m.get("kind") == "style")
+        excess = n_style - _MAX_STYLE
+        if excess > 0:
+            dropped = 0
+            kept = []
+            for m in d["memories"]:
+                if (dropped < excess and m.get("kind") == "style"
+                        and m.get("source") == "auto" and m is not entry):
+                    dropped += 1
+                    continue
+                kept.append(m)
+            if dropped:
+                d["memories"] = kept
         _save(scope, d)
         return _public(entry)
 

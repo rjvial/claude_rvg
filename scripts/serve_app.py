@@ -111,6 +111,27 @@ sys.path.insert(0, str(SCRIPTS))
 # call pops a black console window. 0 on non-Windows (flag doesn't exist).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+
+def _kill_proc_tree(proc) -> None:
+    """Kill a spawned CLI AND its descendants. proc.kill()/terminate() only
+    reaches the direct child — behind a cmd shim (npm installs) or when the
+    CLI spawned MCP-server children, the real work keeps running orphaned,
+    burning tokens and holding a Neo4j connection after the user is gone."""
+    if proc.poll() is not None:
+        return
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10,
+                           creationflags=_NO_WINDOW)
+            return
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
 # --- shared state -----------------------------------------------------------
 # `html` is the rendered shell with the JSON payload inlined as a
 # <script type="application/json"> tag; `html_gz` is its precomputed gzipped
@@ -128,6 +149,11 @@ _lock = threading.Lock()                 # guards _state
 _state_cv = threading.Condition(_lock)
 _sync_lock = threading.Lock()            # ensures only one sync at a time
 _ask_lock = threading.Lock()             # one /api/ask (claude -p) at a time
+# Kill an /api/ask claude -p child after this long with NO stdout output.
+# stream-json emits an event per completed message/tool call, so minutes of
+# total silence means the CLI is wedged — and a wedged child holds _ask_lock
+# forever, turning every later question into "busy" until a server restart.
+ASK_STALL_SECS = 300
 # Client-controlled "hold" timestamp: while now() < _hold_until, the
 # background sync_loop skips its tick. The composer's selection-mode UI
 # heartbeats /api/sync/hold so trashing a selection isn't racing against a
@@ -816,44 +842,84 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
             return
 
         def build_cmd(resume: str | None) -> list[str]:
+            # --append-system-prompt and --model are per-INVOCATION flags:
+            # --resume restores the conversation history but not these, so
+            # they must be passed on every turn or follow-ups run without the
+            # Liam persona / [n]-citation contract / bucket rules.
             cmd = [claude, "-p",
                    "--output-format", "stream-json", "--verbose",
                    "--allowedTools",
-                   "mcp__neo4j__read_neo4j_cypher,mcp__neo4j__get_neo4j_schema"]
+                   "mcp__neo4j__read_neo4j_cypher,mcp__neo4j__get_neo4j_schema",
+                   "--append-system-prompt", ASK_SYSTEM]
+            model_id = _llm_model_id()          # None → Claude Code default
+            if model_id:
+                cmd += ["--model", model_id]
             if resume:
                 cmd += ["--resume", resume]
-            else:
-                cmd += ["--append-system-prompt", ASK_SYSTEM]
-                model_id = _llm_model_id()      # None → Claude Code default
-                if model_id:
-                    cmd += ["--model", model_id]
             if claude.lower().endswith((".cmd", ".bat")):
                 cmd = ["cmd", "/c", *cmd]
             return cmd
 
-        def run_once(resume: str | None) -> tuple[str, str, bool]:
+        def run_once(resume: str | None) -> tuple[str, str, str]:
+            """One claude -p run. Returns (answer, session_id, status) where
+            status is 'ok' | 'error' | 'stalled' | 'disconnected'."""
             nonlocal proc
-            proc = subprocess.Popen(build_cmd(resume), cwd=ROOT,
-                                    stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    text=True, encoding="utf-8",
-                                    errors="replace", bufsize=1,
-                                    creationflags=_NO_WINDOW)
+            # `p` is this run's process; the closures below must capture it
+            # (NOT the nonlocal `proc`, which the retry path rebinds — a
+            # leftover watchdog from run 1 would otherwise judge run 2 by a
+            # stale activity clock and kill it mid-answer).
+            p = proc = subprocess.Popen(build_cmd(resume), cwd=ROOT,
+                                        stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        text=True, encoding="utf-8",
+                                        errors="replace", bufsize=1,
+                                        creationflags=_NO_WINDOW)
             # Feed the (large) prompt from a thread so a full pipe buffer
             # can't deadlock the streaming-stdout read loop.
             def _feed():
                 try:
-                    proc.stdin.write(prompt)
-                    proc.stdin.close()
+                    p.stdin.write(prompt)
+                    p.stdin.close()
                 except (BrokenPipeError, OSError):
                     pass
             threading.Thread(target=_feed, daemon=True).start()
 
+            # Drain stderr concurrently. Left unread, a chatty child fills the
+            # stderr pipe buffer, blocks writing, and stdout never reaches EOF
+            # — the request (and the ask lock) would then hang forever.
+            err_tail: list[str] = []
+
+            def _drain_err():
+                try:
+                    for eline in p.stderr:
+                        err_tail.append(eline.rstrip())
+                        del err_tail[:-10]
+                except (ValueError, OSError):
+                    pass
+            threading.Thread(target=_drain_err, daemon=True).start()
+
+            # Inactivity watchdog: stream-json emits an event at least once
+            # per completed model message / tool call, so a long silence means
+            # the CLI is wedged (auth prompt, dead MCP server, network hang).
+            # Kill it instead of holding the ask lock forever.
+            last_out = [time.monotonic()]
+            stalled = threading.Event()
+
+            def _watchdog():
+                while p.poll() is None:
+                    if time.monotonic() - last_out[0] > ASK_STALL_SECS:
+                        stalled.set()
+                        _kill_proc_tree(p)
+                        return
+                    time.sleep(5)
+            threading.Thread(target=_watchdog, daemon=True).start()
+
             final_answer = ""
             final_sid = resume or ""
             errored = False
-            for line in proc.stdout:
+            for line in p.stdout:
+                last_out[0] = time.monotonic()
                 line = line.strip()
                 if not line:
                     continue
@@ -871,8 +937,8 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
                             if text:
                                 if not write_event({"type": "thinking",
                                                     "text": text}):
-                                    proc.terminate()
-                                    return "", "", True
+                                    _kill_proc_tree(p)
+                                    return "", "", "disconnected"
                         elif btype == "tool_use":
                             name = block.get("name") or "tool"
                             tin = block.get("input") or {}
@@ -888,30 +954,47 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
                             if not write_event({"type": "tool",
                                                 "name": label,
                                                 "detail": detail}):
-                                proc.terminate()
-                                return "", "", True
+                                _kill_proc_tree(p)
+                                return "", "", "disconnected"
                 elif etype == "result":
                     final_answer = (ev.get("result") or "").strip()
                     final_sid = ev.get("session_id") or final_sid
                     if ev.get("is_error"):
                         errored = True
-            # Drain any stderr for diagnostics on a non-zero exit.
-            proc.wait()
-            if proc.returncode != 0 and not final_answer:
+            p.wait()
+            if stalled.is_set():
+                print(f"[serve] ask: claude produced no output for "
+                      f"{ASK_STALL_SECS}s — killed")
+                return "", final_sid, "stalled"
+            if p.returncode != 0 and not final_answer:
                 errored = True
-            return final_answer, final_sid, errored
+            if errored and err_tail:
+                # Server-side diagnostics only; the client gets a sanitized
+                # message below.
+                print("[serve] ask: claude stderr tail:\n  "
+                      + "\n  ".join(err_tail))
+            return (final_answer, final_sid,
+                    "error" if errored else "ok")
 
         write_event({"type": "phase", "phase": "thinking"})
-        answer, sid, errored = run_once(session_id)
-        if errored and session_id:
+        answer, sid, status = run_once(session_id)
+        if status == "disconnected":
+            return                       # client gone — don't burn a retry
+        if status in ("error", "stalled") and session_id:
             # Stored session may have expired/been pruned — retry fresh.
             write_event({"type": "phase", "phase": "retrying"})
-            answer, sid, errored = run_once(None)
+            answer, sid, status = run_once(None)
+            if status == "disconnected":
+                return
 
-        if errored or not answer:
-            write_event({"type": "error",
-                         "message": answer
-                         or "claude returned an error"})
+        if status != "ok" or not answer:
+            if status == "stalled":
+                msg = (f"Liam stopped responding (no output for "
+                       f"{ASK_STALL_SECS // 60} min) — the process was "
+                       f"stopped. Try asking again.")
+            else:
+                msg = answer or "claude returned an error"
+            write_event({"type": "error", "message": msg})
             return
         write_event({"type": "done", "answer": answer, "session_id": sid})
         # Auto-learn: in the background, extract any durable preference/fact
@@ -922,10 +1005,7 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
                              args=(question, answer), daemon=True).start()
     finally:
         if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            _kill_proc_tree(proc)
         _ask_lock.release()
 
 
@@ -935,9 +1015,22 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
 _srv = None
 
 
+# Serialize rebuild(): it is called from the sync loop, trash/purge background
+# passes and boot reconcile, which can overlap. Two concurrent rebuilds each
+# pay the full multi-second graph fetch, and both compute v = cur_v + 1 — the
+# slower (staler) one can publish LAST under the same bumped version, so
+# clients reload into old data and get no further banner until the next change.
+_rebuild_lock = threading.Lock()
+
+
 def rebuild() -> None:
     """Re-query Neo4j, refresh the cached HTML + its gzipped form, and bring
     the body store up to date with emails.jsonl."""
+    with _rebuild_lock:
+        _rebuild_locked()
+
+
+def _rebuild_locked() -> None:
     import body_store
     added = body_store.refresh()
     if added:
@@ -1524,12 +1617,38 @@ def _body_search(term: str) -> list[list[str]]:
     drv = graph_app.driver()
     try:
         with drv.session() as s:
-            rows = s.run(
-                "MATCH (m:Message) "
-                "WHERE m.body_clean IS NOT NULL "
-                "  AND toLower(m.body_clean) CONTAINS $q "
-                "RETURN m.gmail_message_id AS mid, m.account_owner AS acct",
-                q=term).data()
+            # Fast path: the message_text full-text index narrows to
+            # candidates (word-prefix match), then CONTAINS verifies the
+            # original substring semantics on just those bodies. The old
+            # code ran an unindexed toLower(body_clean) CONTAINS scan over
+            # EVERY message body for EVERY settled search word — the single
+            # biggest source of typing-time stutter.
+            import re as _re
+            if _re.search(r"\s", term):
+                lucene = '"' + _re.sub(r'["\\]', " ", term) + '"'
+            else:
+                lucene = _re.sub(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)',
+                                 r"\\\1", term) + "*"
+            try:
+                rows = s.run(
+                    "CALL db.index.fulltext.queryNodes('message_text', $q) "
+                    "YIELD node AS m "
+                    "WHERE m.body_clean IS NOT NULL "
+                    "  AND toLower(m.body_clean) CONTAINS $raw "
+                    "RETURN m.gmail_message_id AS mid, "
+                    "       m.account_owner AS acct "
+                    "LIMIT 20000",
+                    q=lucene, raw=term).data()
+            except Exception:
+                # Index missing (setup not run) — fall back to the full scan.
+                rows = s.run(
+                    "MATCH (m:Message) "
+                    "WHERE m.body_clean IS NOT NULL "
+                    "  AND toLower(m.body_clean) CONTAINS $q "
+                    "RETURN m.gmail_message_id AS mid, "
+                    "       m.account_owner AS acct "
+                    "LIMIT 20000",
+                    q=term).data()
     finally:
         drv.close()
     return [[r["mid"], r["acct"]] for r in rows]
@@ -1876,29 +1995,30 @@ def _do_compose_draft(payload: dict) -> dict:
 
     # Carry the user's learned style preferences (tone, language, length) so a
     # drafted email matches how they like Liam to write — from the COMPOSE
-    # scope only, kept separate from the Ask assistant's memory. Only on the
-    # FIRST turn; a resumed session already carries them in its history.
-    mem = ""
+    # scope only, kept separate from the Ask assistant's memory. Used only in
+    # FRESH prompts (a resumed session already carries them in its history),
+    # but computed for every turn because a resumed follow-up can fall back to
+    # a fresh run when the stored session has expired — that fresh retry must
+    # not lose the memory/style context.
+    try:
+        import ask_memory
+        mem = ask_memory.format_block(instruction, scope="compose")
+    except Exception:
+        mem = ""
+    # Per-recipient writing style: detect the To addressee and, if we've
+    # learned how the user writes to them, inject that voice so the draft
+    # reads as if they wrote it. style_name is echoed to the client so the
+    # UI can confirm whose style was applied.
     style = ""
     style_name = ""
-    if not session_id:
-        try:
-            import ask_memory
-            mem = ask_memory.format_block(instruction, scope="compose")
-        except Exception:
-            mem = ""
-        # Per-recipient writing style: detect the To addressee and, if we've
-        # learned how the user writes to them, inject that voice so the draft
-        # reads as if they wrote it. style_name is echoed to the client so the
-        # UI can confirm whose style was applied.
-        try:
-            import style_profiles
-            prof = style_profiles.find_profile(to)
-            if prof:
-                style = style_profiles.profile_block(prof)
-                style_name = prof.get("name", "")
-        except Exception:
-            style = ""
+    try:
+        import style_profiles
+        prof = style_profiles.find_profile(to)
+        if prof:
+            style = style_profiles.profile_block(prof)
+            style_name = prof.get("name", "")
+    except Exception:
+        style = ""
 
     def build_prompt(resume: bool) -> str:
         parts: list[str] = []
@@ -1924,6 +2044,18 @@ def _do_compose_draft(payload: dict) -> dict:
             if original and mode in ("reply", "reply-all", "forward"):
                 parts.append("ORIGINAL MESSAGE (context only — do NOT repeat "
                              "it):\n" + original[:6000])
+            # The editor's current content. Matters most on the fresh RETRY of
+            # a follow-up (expired session): "make it shorter" is meaningless
+            # without the draft it refers to. Also helps a genuine first turn
+            # where the user hand-wrote a partial draft ("finish this").
+            if cur_subject or cur_body:
+                cur = ("Subject: " + (cur_subject or "(none)") + "\n\n"
+                       + (cur_body or "(empty)"))
+                parts.append("CURRENT DRAFT already in the editor — if the "
+                             "instruction refers to an existing draft "
+                             "('shorten it', 'translate it', 'add …'), THIS "
+                             "is that draft; revise it rather than starting "
+                             "over:\n" + cur[:8000])
             parts.append("INSTRUCTION:\n" + instruction)
         parts.append("Return the JSON object now.")
         return "\n\n".join(parts)
@@ -1931,15 +2063,18 @@ def _do_compose_draft(payload: dict) -> dict:
     def build_cmd(resume_sid: str | None) -> list[str]:
         # --output-format json wraps the answer in an envelope that carries the
         # session_id, so the client can resume for the next follow-up.
+        # --append-system-prompt and --model are per-INVOCATION flags that
+        # --resume does NOT restore — without re-passing them, every follow-up
+        # turn loses the JSON {"subject","body"} output contract and Liam's
+        # reply comes back as prose that ends up dumped into the email body.
         cmd = [claude, "-p", "--output-format", "json",
-               "--strict-mcp-config"]                  # no MCP needed to draft
+               "--strict-mcp-config",                  # no MCP needed to draft
+               "--append-system-prompt", COMPOSE_SYSTEM]
+        model_id = _llm_model_id()                      # None → CC default
+        if model_id:
+            cmd += ["--model", model_id]
         if resume_sid:
             cmd += ["--resume", resume_sid]
-        else:
-            cmd += ["--append-system-prompt", COMPOSE_SYSTEM]
-            model_id = _llm_model_id()                  # None → CC default
-            if model_id:
-                cmd += ["--model", model_id]
         if claude.lower().endswith((".cmd", ".bat")):
             cmd = ["cmd", "/c", *cmd]
         return cmd
@@ -1967,11 +2102,15 @@ def _do_compose_draft(payload: dict) -> dict:
 
     if not _draft_lock.acquire(blocking=False):
         return {"ok": False, "error": "Liam is already drafting — one moment"}
+    used_fresh = session_id is None
     try:
         raw, new_sid, err = run_once(session_id)
         if err and session_id:
             # The stored session may have expired/been pruned — retry fresh.
+            # build_prompt(False) carries the current draft + memory/style, so
+            # a follow-up instruction still revises the right draft.
             raw, new_sid, err = run_once(None)
+            used_fresh = True
     finally:
         _draft_lock.release()
     if err:
@@ -1993,7 +2132,10 @@ def _do_compose_draft(payload: dict) -> dict:
         threading.Thread(target=_learn_from_compose,
                          args=(instruction, body), daemon=True).start()
     return {"ok": True, "subject": out_subject, "body": body,
-            "session_id": new_sid, "style_applied": style_name}
+            "session_id": new_sid,
+            # Only meaningful when the style card was actually injected (fresh
+            # prompt); a resumed session already carries it in its history.
+            "style_applied": style_name if used_fresh else ""}
 
 
 # --- trash: move messages to Gmail Trash + purge local mirror ------------
@@ -2225,14 +2367,29 @@ def _do_trash(payload: dict) -> dict:
             for mid in mids:
                 failed.append({"mid": mid, "acct": acct, "error": msg})
             continue
-        for mid in mids:
+        # batchModify with addLabelIds:TRASH == trash, one round-trip per
+        # 1000 ids instead of one per message (a 50-message selection used
+        # to block the UI for ~20s). All-or-nothing per batch, so on a batch
+        # error fall back to per-message trash to salvage the valid ids —
+        # same pattern as _do_mark_read below.
+        for start in range(0, len(mids), 1000):
+            chunk = mids[start:start + 1000]
             try:
-                service.users().messages().trash(
-                    userId="me", id=mid).execute()
-                trashed.add((acct, mid))
-            except Exception as e:
-                failed.append({"mid": mid, "acct": acct,
-                               "error": _safe_err("trash: modify", e)})
+                service.users().messages().batchModify(
+                    userId="me",
+                    body={"ids": chunk,
+                          "addLabelIds": ["TRASH"],
+                          "removeLabelIds": ["INBOX"]}).execute()
+                trashed.update((acct, mid) for mid in chunk)
+            except Exception:
+                for mid in chunk:
+                    try:
+                        service.users().messages().trash(
+                            userId="me", id=mid).execute()
+                        trashed.add((acct, mid))
+                    except Exception as e:
+                        failed.append({"mid": mid, "acct": acct,
+                                       "error": _safe_err("trash: modify", e)})
 
     if trashed:
         # Fast path the client waits for: Neo4j is now consistent with what
