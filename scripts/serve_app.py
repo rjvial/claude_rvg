@@ -88,6 +88,9 @@ from urllib.parse import parse_qs, urlsplit, quote
 
 from _common import (
     DATA_DIR,
+    claude_env,
+    claude_oauth_token,
+    save_claude_oauth_token,
     NEO4J_HOME,
     NEO4J_JAVA_HOME,
     NEO4J_SERVICE,
@@ -189,13 +192,68 @@ def _safe_err(context: str, exc: BaseException) -> str:
 # panel. Currently just the LLM model used by /api/ask. Kept here (not in
 # _common) because it's server-only and tied to the claude -p invocation below.
 SETTINGS_FILE = DATA_DIR / "settings.json"
-# UI model key → the value passed to `claude -p --model`. "default" (or any
-# unknown key) means: pass no --model, i.e. use Claude Code's own model.
-LLM_MODELS = {
+# The Settings dropdown offers every model currently served by the Anthropic
+# Models API (GET /v1/models — the same subscription OAuth token `claude -p`
+# uses authorizes it). The stored setting is the model id itself, passed
+# verbatim to `claude -p --model`; "default" (or any unknown value) means: pass
+# no --model, i.e. use Claude Code's own model. The static snapshot below is
+# the fallback when no token is configured or the API is unreachable, and the
+# legacy map keeps pre-existing settings.json values ("opus"/"sonnet"/"haiku"
+# from the old hardcoded list) resolving.
+_FALLBACK_MODELS = [
+    {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+    {"id": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
+    {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5"},
+]
+_LEGACY_MODEL_KEYS = {
     "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+_MODELS_TTL = 3600.0                     # re-fetch the live list hourly
+_models_lock = threading.Lock()
+_models_cache: dict = {"at": 0.0, "models": []}
+
+
+def _fetch_llm_models() -> list[dict]:
+    """Live [{id, label}] list from the Anthropic Models API, newest first
+    (the API's own order). Returns [] on any failure — no token, network
+    error, unexpected payload — so callers can fall back."""
+    tok = claude_oauth_token()
+    if not tok:
+        return []
+    import urllib.request
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=100",
+        headers={"Authorization": f"Bearer {tok}",
+                 "anthropic-version": "2023-06-01",
+                 "anthropic-beta": "oauth-2025-04-20"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print("[serve] models fetch failed:", type(e).__name__)
+        return []
+    out = []
+    for m in (data.get("data") or []) if isinstance(data, dict) else []:
+        mid = m.get("id") if isinstance(m, dict) else None
+        if isinstance(mid, str) and mid:
+            out.append({"id": mid, "label": m.get("display_name") or mid})
+    return out
+
+
+def _llm_models() -> list[dict]:
+    """Models for the Settings dropdown: the live list (cached _MODELS_TTL),
+    else the last successful fetch (stale beats static), else the snapshot."""
+    now = time.time()
+    with _models_lock:
+        if _models_cache["models"] and now - _models_cache["at"] < _MODELS_TTL:
+            return list(_models_cache["models"])
+    models = _fetch_llm_models()
+    with _models_lock:
+        if models:
+            _models_cache.update(at=now, models=models)
+        return list(_models_cache["models"] or _FALLBACK_MODELS)
 
 
 def _load_settings() -> dict:
@@ -216,14 +274,18 @@ def _save_settings(d: dict) -> None:
 
 
 def _get_llm_model_key() -> str:
-    """The chosen UI model key, or 'default' when unset/invalid."""
+    """The chosen model id (legacy aliases mapped), or 'default' when unset.
+    Deliberately does NOT re-validate against the live list — that would put a
+    network fetch on the ask/compose hot path; validation happens at save time
+    and a since-retired model simply surfaces as a claude -p model error."""
     key = _load_settings().get("llm_model") or "default"
-    return key if key in LLM_MODELS else "default"
+    return _LEGACY_MODEL_KEYS.get(key, key)
 
 
 def _llm_model_id() -> str | None:
-    """The `claude -p --model` value for the chosen key, or None for default."""
-    return LLM_MODELS.get(_get_llm_model_key())
+    """The `claude -p --model` value, or None for Claude Code's default."""
+    key = _get_llm_model_key()
+    return None if key == "default" else key
 
 
 def _get_auto_learn(scope: str = "ask") -> bool:
@@ -283,7 +345,8 @@ def _learn_from_turn(question: str, answer: str) -> None:
     try:
         out = subprocess.run(cmd, cwd=ROOT, input=user, capture_output=True,
                              text=True, encoding="utf-8", errors="replace",
-                             timeout=90, creationflags=_NO_WINDOW)
+                             timeout=90, creationflags=_NO_WINDOW,
+                             env=claude_env())
     except Exception as e:
         print("[serve] memory-learn call failed:", type(e).__name__)
         return
@@ -343,7 +406,8 @@ def _learn_from_compose(instruction: str, draft: str) -> None:
     try:
         out = subprocess.run(cmd, cwd=ROOT, input=user, capture_output=True,
                              text=True, encoding="utf-8", errors="replace",
-                             timeout=90, creationflags=_NO_WINDOW)
+                             timeout=90, creationflags=_NO_WINDOW,
+                             env=claude_env())
     except Exception as e:
         print("[serve] compose memory-learn call failed:", type(e).__name__)
         return
@@ -494,7 +558,8 @@ def _learn_from_feedback(question: str, answer: str, note: str,
     try:
         out = subprocess.run(cmd, cwd=ROOT, input=user, capture_output=True,
                              text=True, encoding="utf-8", errors="replace",
-                             timeout=90, creationflags=_NO_WINDOW)
+                             timeout=90, creationflags=_NO_WINDOW,
+                             env=claude_env())
     except Exception as e:
         print("[serve] feedback-learn call failed:", type(e).__name__)
         return
@@ -536,11 +601,15 @@ def _do_ask_feedback(payload: dict) -> dict:
     return {"ok": True, "learning": learning}
 
 
-# --- Claude Code subscription auth (claude auth …) --------------------------
-# /api/ask shells out to `claude -p`, which authenticates with the local Claude
-# Code subscription (no API key). The Settings panel surfaces that login so the
-# user can sign in / out without touching a terminal — mirroring the Gmail
-# OAuth flow. `claude auth login` opens a browser and runs its own localhost
+# --- Claude Code subscription auth -------------------------------------------
+# /api/ask shells out to `claude -p`, which bills the Claude subscription (no
+# API key). Preferred auth is HEADLESS: a long-lived OAuth token minted once
+# with `claude setup-token` and stored in data/claude_oauth_token.txt (or a
+# shell-set CLAUDE_CODE_OAUTH_TOKEN) — claude_env() injects it into every
+# `claude` child, so Liam never depends on the CLI's interactive login state.
+# The Settings panel has a paste-token field for it (/api/claude/token).
+# The interactive browser login below remains as the fallback when no token is
+# configured: `claude auth login` opens a browser and runs its own localhost
 # callback; we spawn it, scrape any printed URL (in case auto-open fails) and
 # let the client poll `claude auth status` until login settles.
 _claude_login_lock = threading.Lock()
@@ -560,10 +629,16 @@ def _claude_cmd(*args: str) -> list[str]:
 
 def _claude_status() -> dict:
     """Parse `claude auth status --json`. Always returns a dict with at least
-    `installed` and `loggedIn`; never raises."""
+    `installed`, `loggedIn` and `token`; never raises."""
     cmd = _claude_cmd("auth", "status", "--json")
     if not cmd:
-        return {"installed": False, "loggedIn": False}
+        return {"installed": False, "loggedIn": False, "token": False}
+    if claude_oauth_token():
+        # Headless auth: every `claude -p` child gets CLAUDE_CODE_OAUTH_TOKEN
+        # injected (see claude_env), so Liam works regardless of the CLI's own
+        # stored login — no need to shell out to `claude auth status`.
+        return {"installed": True, "loggedIn": True, "token": True,
+                "authMethod": "OAuth token (subscription)"}
     try:
         out = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=30,
@@ -575,7 +650,22 @@ def _claude_status() -> dict:
         data = {}
     data["installed"] = True
     data.setdefault("loggedIn", False)
+    data["token"] = False
     return data
+
+
+def _claude_token_set(token: str) -> dict:
+    """Save (or, with an empty token, remove) the headless Claude Code OAuth
+    token. Minted once with `claude setup-token`; bills the subscription."""
+    token = (token or "").strip()
+    if token and not token.startswith("sk-ant-"):
+        return {"ok": False, "error": "that doesn't look like a Claude token "
+                                      "(expected sk-ant-…)"}
+    try:
+        save_claude_oauth_token(token)
+    except OSError as e:
+        return {"ok": False, "error": _safe_err("claude token", e)}
+    return {"ok": True, "token": bool(token)}
 
 
 def _claude_login_start() -> dict:
@@ -670,6 +760,17 @@ ASK_SYSTEM = (
     "budget. Cite specific messages inline with bare bracket markers, e.g. "
     "[3] — do NOT write URLs; the app turns each [n] into a clickable link, "
     "so a bare [3] is the correct and complete citation."
+    "\n\nENTITY CARDS. When the question names a person or organisation, the "
+    "retrieved context OPENS with ENTITY CARDS — profiles computed "
+    "deterministically from the graph: every ALIAS_OF-merged address, their "
+    "org, the primary-mail count with first/last dates, a per-year "
+    "histogram, and (for people) the ABOUT count — messages that mention "
+    "their name but do NOT have them as a participant. The cards already "
+    "implement the alias-expansion, WITH/ABOUT and histogram rules below, so "
+    "TRUST their numbers for spans, counts, and first/last appearances "
+    "instead of recomputing them; spend your Cypher calls fetching the "
+    "specific messages behind them (e.g. the ABOUT mail, or one year's "
+    "messages) when the answer needs quotes or detail."
     "\n\nYou have read-only Neo4j tools (read_neo4j_cypher, get_neo4j_schema) "
     "covering all three mailboxes. USE THEM ACTIVELY when more detail would "
     "help — don't settle for the bundle alone. The patterns that pay off "
@@ -748,7 +849,8 @@ ASK_SYSTEM = (
     "ABOUT search before you state any span, first-appearance, or absence."
     "\n  2. Aggregate first, then narrate. Run a per-year (or per-month) "
     "histogram across the FULL range and walk EVERY active period in your "
-    "answer — do not skip or silently collapse years:"
+    "answer — do not skip or silently collapse years (when an ENTITY CARD "
+    "already carries the histogram, walk ITS years instead of re-running it):"
     "\n      …WHERE <anchor> WITH substring(m.sent_at,0,4) AS yr, "
     "count(DISTINCT m) AS n RETURN yr, n ORDER BY yr"
     "\n  3. For 'all the times / todas las veces / lista todos' questions, "
@@ -777,16 +879,20 @@ ASK_SYSTEM = (
 
 
 def _retrieve_context(question: str) -> tuple[str, list]:
-    """Graph-RAG retrieval: semantic vector search + graph expansion, rendered
-    as a context bundle. Returns (context_text, sources) — see
-    graph_rag.build_context. Raises with a setup hint if the vector index is
-    missing (load_neo4j.py --setup + embed_messages.py not run yet)."""
+    """Graph-RAG retrieval: entity anchoring + semantic/keyword search +
+    graph expansion, rendered as a context bundle. When the question names a
+    known person/org, deterministic ENTITY CARDS (addresses, org, per-year
+    counts, WITH/ABOUT split) open the bundle. Returns (context_text,
+    sources) — see graph_rag.build_context. Raises with a setup hint if the
+    vector index is missing (load_neo4j.py --setup + embed_messages.py not
+    run yet)."""
     import graph_app
     import graph_rag
     drv = graph_app.driver()
     try:
         with drv.session() as s:
-            seeds = graph_rag.retrieve(s, question)
+            anchors = graph_rag.resolve_anchors(s, question)
+            seeds = graph_rag.retrieve(s, question, anchors=anchors)
     except Exception as e:
         if "message_embedding" in str(e) or "queryNodes" in str(e):
             raise RuntimeError(
@@ -796,7 +902,11 @@ def _retrieve_context(question: str) -> tuple[str, list]:
         raise
     finally:
         drv.close()
-    return graph_rag.build_context(seeds)
+    context, sources = graph_rag.build_context(seeds)
+    cards = graph_rag.entity_cards(anchors)
+    if cards:
+        context = cards + "\n\n" + context
+    return context, sources
 
 
 def _stream_ask(write_event, question: str, session_id: str | None) -> None:
@@ -808,6 +918,7 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
     Event types emitted:
       phase    — {phase: "retrieving" | "thinking"}
       sources  — {sources: [...]} (the same list build_context produces)
+      model    — {id, label} (the model actually answering, from the CLI init)
       thinking — {text: "..."} (one assistant text message)
       tool     — {name, detail} (one tool_use the model issued)
       done     — {answer, session_id} (final answer + resumable id)
@@ -863,6 +974,15 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
             # Liam persona / [n]-citation contract / bucket rules.
             cmd = [claude, "-p",
                    "--output-format", "stream-json", "--verbose",
+                   # Load ONLY the project's neo4j MCP server. Without
+                   # --strict-mcp-config the child also inherits every
+                   # user-scope MCP server (Gmail, Drive, …); that many tools
+                   # flips the CLI into deferred-tool mode, and the model must
+                   # then burn turns calling ToolSearch just to reach the
+                   # neo4j tools — the UI shows each one as a "⚙ ToolSearch"
+                   # line while the slow servers connect.
+                   "--mcp-config", str(ROOT / ".mcp.json"),
+                   "--strict-mcp-config",
                    "--allowedTools",
                    "mcp__neo4j__read_neo4j_cypher,mcp__neo4j__get_neo4j_schema",
                    "--append-system-prompt", ASK_SYSTEM]
@@ -889,7 +1009,8 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
                                         stderr=subprocess.PIPE,
                                         text=True, encoding="utf-8",
                                         errors="replace", bufsize=1,
-                                        creationflags=_NO_WINDOW)
+                                        creationflags=_NO_WINDOW,
+                                        env=claude_env())
             # Feed the (large) prompt from a thread so a full pipe buffer
             # can't deadlock the streaming-stdout read loop.
             def _feed():
@@ -933,6 +1054,7 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
             final_answer = ""
             final_sid = resume or ""
             errored = False
+            last_tool = None      # (label, detail) of the last tool event sent
             for line in p.stdout:
                 last_out[0] = time.monotonic()
                 line = line.strip()
@@ -943,7 +1065,23 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
                 except json.JSONDecodeError:
                     continue
                 etype = ev.get("type")
-                if etype == "assistant":
+                if etype == "system" and ev.get("subtype") == "init":
+                    # The CLI announces the ACTUAL model here — meaningful
+                    # even on "default", where we pass no --model and Claude
+                    # Code picks. Label lookup uses only the warm cache (no
+                    # network on the ask hot path); the raw id is fine as a
+                    # fallback.
+                    mid = ev.get("model") or ""
+                    if mid:
+                        with _models_lock:
+                            cached = list(_models_cache["models"])
+                        label = next((m["label"] for m in cached
+                                      if m["id"] == mid), mid)
+                        if not write_event({"type": "model", "id": mid,
+                                            "label": label}):
+                            _kill_proc_tree(p)
+                            return "", "", "disconnected"
+                elif etype == "assistant":
                     for block in (ev.get("message", {}).get("content")
                                   or []):
                         btype = block.get("type")
@@ -963,9 +1101,20 @@ def _stream_ask(write_event, question: str, session_id: str | None) -> None:
                             elif "schema" in name.lower():
                                 detail = ""
                                 label = "Reading the graph schema"
+                            elif name == "ToolSearch":
+                                # CLI plumbing (loading deferred tool
+                                # schemas), not a real graph action.
+                                detail = ""
+                                label = "Loading graph tools…"
                             else:
                                 detail = ""
                                 label = name
+                            # Collapse consecutive repeats: a model retrying
+                            # the same call (e.g. while an MCP server is
+                            # still connecting) must not flood the trace.
+                            if (label, detail) == last_tool:
+                                continue
+                            last_tool = (label, detail)
                             if not write_event({"type": "tool",
                                                 "name": label,
                                                 "detail": detail}):
@@ -2182,7 +2331,8 @@ def _do_compose_draft(payload: dict) -> dict:
                                  input=build_prompt(bool(resume_sid)),
                                  capture_output=True, text=True,
                                  encoding="utf-8", errors="replace",
-                                 timeout=120, creationflags=_NO_WINDOW)
+                                 timeout=120, creationflags=_NO_WINDOW,
+                                 env=claude_env())
         except Exception as e:
             return "", "", _safe_err("compose draft", e)
         env = _parse_json_object(out.stdout or "")
@@ -2942,10 +3092,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 st = _auth_status.get(acct, "idle")
             self._send(200, json.dumps({"status": st}), "application/json")
         elif path == "/api/settings":
-            # Settings panel state. Reports the chosen LLM model key plus the
-            # available options so the UI never hard-codes the model list.
+            # Settings panel state. Reports the chosen LLM model plus every
+            # model currently available (live from the Anthropic Models API,
+            # cached) so the UI never hard-codes the model list.
             data = {"llm_model": _get_llm_model_key(),
-                    "llm_models": list(LLM_MODELS.keys()),
+                    "llm_models": _llm_models(),
                     "ask_auto_learn": _get_auto_learn("ask"),
                     "compose_auto_learn": _get_auto_learn("compose")}
             self._send(200, json.dumps(data), "application/json")
@@ -3174,7 +3325,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        json.dumps(result), "application/json")
         elif p == "/api/settings":
             # Persist a settings change. Only known keys are accepted; the LLM
-            # model is validated against LLM_MODELS (unknown → 'default').
+            # model is validated against the available list (unknown →
+            # 'default').
             n = int(self.headers.get("Content-Length", 0) or 0)
             try:
                 payload = json.loads(self.rfile.read(n) or b"{}")
@@ -3184,8 +3336,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             s = _load_settings()
             if "llm_model" in payload:
-                key = payload.get("llm_model")
-                s["llm_model"] = key if key in LLM_MODELS else "default"
+                key = _LEGACY_MODEL_KEYS.get(payload.get("llm_model"),
+                                             payload.get("llm_model"))
+                known = {m["id"] for m in _llm_models()}
+                s["llm_model"] = key if key in known else "default"
             if "ask_auto_learn" in payload:
                 s["ask_auto_learn"] = bool(payload.get("ask_auto_learn"))
             if "compose_auto_learn" in payload:
@@ -3236,6 +3390,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(500, json.dumps(
                     {"ok": False, "error": _safe_err("api/memory/delete", e)}),
                     "application/json")
+        elif p == "/api/claude/token":
+            # Save/remove the long-lived headless-auth token (claude
+            # setup-token). Empty token ⇒ remove, falling back to the CLI's
+            # interactive login if one exists.
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except (json.JSONDecodeError, ValueError):
+                payload = {}
+            result = _claude_token_set(payload.get("token") or "")
+            self._send(200 if result.get("ok") else 400,
+                       json.dumps(result), "application/json")
         elif p == "/api/claude/login":
             # Launch the Claude Code subscription OAuth flow (opens a browser).
             result = _claude_login_start()

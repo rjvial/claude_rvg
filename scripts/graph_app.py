@@ -828,6 +828,10 @@ PAGE = r"""<!DOCTYPE html>
   .askhd .asknew:hover{border-color:var(--accent);color:var(--accent-deep)}
   .askhd .x{cursor:pointer;color:var(--ink-3);font-size:16px}
   .askhd .x:hover{color:var(--accent-deep)}
+  .askmodel{margin-left:8px;font-size:11px;font-weight:normal;
+    color:var(--ink-3);background:var(--raised);border:1px solid var(--line);
+    border-radius:9px;padding:1px 8px;white-space:nowrap}
+  .askmodel:empty{display:none}
   /* Settings has no .winctl wrapper — push its lone close ✕ to the far right. */
   #acctsx{margin-left:auto}
   /* chat transcript */
@@ -1281,14 +1285,11 @@ PAGE = r"""<!DOCTYPE html>
         <div class="setrow">
           <select id="llmmodel">
             <option value="default">Default (Claude Code)</option>
-            <option value="opus">Opus 4.8</option>
-            <option value="sonnet">Sonnet 4.6</option>
-            <option value="haiku">Haiku 4.5</option>
           </select>
           <span id="llmmsg" class="setmsg"></span>
         </div>
-        <div class="sethint">Model Liam uses. "Default" uses Claude
-          Code's own model.</div>
+        <div class="sethint">Model Liam uses — the list is fetched live
+          from Anthropic. "Default" uses Claude Code's own model.</div>
       </div>
       <div class="setsec">
         <div class="setsechd">Claude OAuth</div>
@@ -1322,6 +1323,7 @@ PAGE = r"""<!DOCTYPE html>
 <div id="ask">
   <div class="askcard">
     <div class="askhd">✦ Liam — your mail assistant
+      <span id="askmodel" class="askmodel"></span>
       <span class="winctl">
         <button class="asknew" id="asknew" title="Start a new conversation">+ New chat</button>
         <span class="x" id="askx">✕</span></span></div>
@@ -1577,20 +1579,20 @@ let listIdx = MSGS.map((m, i) => i)
   .sort((a, b) => (MSGS[b].sent || "").localeCompare(MSGS[a].sent || ""));
 let view = listIdx, listCur = 0;        // listCur = highlighted row in view
 // Bucket (treatment-tier) filter — a multi-select dropdown that replaces the
-// old Spam toggle. Default shows ONLY 'primary'; the lite tiers (promotions/
-// social/updates/forums/spam) are opt-in. 'primary' is always offered even if
-// no such message is currently loaded. `let` so _rebuildIndices can refresh the
-// option list after a payload swap; bucketSel (a Set, mutated in place) is
-// preserved across the swap, like acctSel.
+// old Spam toggle. Default shows ALL buckets; individual tiers (promotions/
+// social/updates/forums/spam) can be deselected. 'primary' is always offered
+// even if no such message is currently loaded. `let` so _rebuildIndices can
+// refresh the option list after a payload swap; bucketSel (a Set, mutated in
+// place) is preserved across the swap, like acctSel.
 let BUCKETS = [...new Set(MSGS.map(m => m.bucket).filter(Boolean))]
   .sort((a, b) => BUCKET_ORDER.indexOf(a) - BUCKET_ORDER.indexOf(b));
 if(!BUCKETS.includes("primary")) BUCKETS.unshift("primary");
-const bucketSel = new Set(["primary"]);   // default: only primary visible
-// "Filtered" means the selection differs from the primary-only default — used
+const bucketSel = new Set(BUCKETS);       // default: every bucket visible
+// "Filtered" means the selection differs from the all-buckets default — used
 // for the ✕ Clear button and the subtitle. (matches() applies the filter
 // directly off bucketSel, so this is only about whether to *advertise* it.)
 function bucketFiltered(){
-  return !(bucketSel.size === 1 && bucketSel.has("primary"));
+  return bucketSel.size !== BUCKETS.length;
 }
 
 // --- search ----------------------------------------------------------
@@ -1775,10 +1777,10 @@ function matches(i){
   // that re-fetches a still-stale payload.
   if(REMOVED.size && REMOVED.has(remKey(m))) return false;
   // Bucket (tier) filter: only the currently-selected buckets are shown. The
-  // default selection is primary-only, so lite mail (promotions / social /
-  // updates / forums / spam) stays hidden until opted in via the header
-  // bucket dropdown. m.bucket is always one of BUCKETS, so an empty selection
-  // simply shows nothing (mirrors deselecting every account).
+  // default selection is every bucket, so all mail is visible until tiers are
+  // deselected via the header bucket dropdown. m.bucket is always one of
+  // BUCKETS, so an empty selection simply shows nothing (mirrors deselecting
+  // every account).
   if(!bucketSel.has(m.bucket)) return false;
   for(const t of QTOK){
     if(t.has !== undefined){
@@ -1851,13 +1853,11 @@ function updateSub(){
       + MSGS.length.toLocaleString() + " messages";
     return;
   }
-  // Default view: primary only, nothing else filtered. Headline counts what's
-  // visible, and flags how much lite mail is hidden so it's discoverable.
-  const hidden = MSGS.length - view.length;
-  let s = view.length.toLocaleString() + " messages · "
+  // Default view: every bucket visible, nothing filtered — headline counts
+  // everything. (view can still be slightly smaller than MSGS while trashed
+  // rows sit in REMOVED awaiting the server-side cache rebuild.)
+  $("sub").textContent = view.length.toLocaleString() + " messages · "
     + Object.keys(CONV).length.toLocaleString() + " conversations";
-  if(hidden > 0) s += " · " + hidden.toLocaleString() + " lite hidden";
-  $("sub").textContent = s;
 }
 function rebuildList(){
   computeHL();
@@ -1867,9 +1867,9 @@ function rebuildList(){
   _ensureBody();
   // Always run matches(): besides user-set filters it applies two always-on
   // partitions — the just-trashed REMOVED set and the bucket-tier filter
-  // (matches() hides any message whose bucket isn't selected; the default
-  // selection is primary-only). Gating this on anyFilter() would let an
-  // unfiltered list bypass both, leaking lite mail and lingering trashed rows.
+  // (matches() hides any message whose bucket isn't selected). Gating this on
+  // anyFilter() would let an unfiltered list bypass both, leaking deselected
+  // tiers and lingering trashed rows.
   view = listIdx.filter(matches);
   listCur = 0;
   $("spacer").style.height = (view.length * LROW) + "px";
@@ -2570,7 +2570,7 @@ function clearAll(){
   syncAcct();
   $("acctf").classList.remove("open");
   bucketSel.clear();
-  bucketSel.add("primary");                  // back to primary-only default
+  BUCKETS.forEach(b => bucketSel.add(b));    // all buckets back on (default)
   syncBucket();
   $("bucketf").classList.remove("open");
   dropSelectionOnFilterChange();
@@ -3052,9 +3052,10 @@ function applyColsVisibility(){
 }
 
 // --- bucket (tier) filter: a multi-select dropdown in the header bar that
-// replaces the old Spam toggle. Mirrors buildAcctFilter(): 'primary' shows by
-// default, lite tiers are opt-in. Changing it is a filter change, so it drops
-// any in-progress selection (a destructive action must never touch hidden rows).
+// replaces the old Spam toggle. Mirrors buildAcctFilter(): every bucket shows
+// by default, tiers are deselectable. Changing it is a filter change, so it
+// drops any in-progress selection (a destructive action must never touch
+// hidden rows).
 function bucketDispLabel(){
   const n = bucketSel.size;
   if(n === 0) return "None";
@@ -3205,7 +3206,37 @@ function newChat(){
   askBubble("intro", "Hi, I'm Liam. Ask anything about your mail — I keep "
     + "the conversation, so follow-up questions work.");
 }
+// The configured model (Settings → LLM Model), prefetched at page load so the
+// header chip shows it the moment the window opens rather than only after the
+// first streamed answer. The streamed "model" event still overwrites it with
+// the ACTUAL answering model — they differ only on "default", where Claude
+// Code itself picks.
+let askModelInfo = null;               // {id, label}, null while loading
+async function loadAskModelInfo(){
+  try{
+    const r = await fetch("api/settings", {cache: "no-store"});
+    const d = await r.json();
+    const cur = d.llm_model || "default";
+    if(cur === "default"){
+      askModelInfo = {id: "", label: "Default (Claude Code)"};
+    }else{
+      const m = (Array.isArray(d.llm_models) ? d.llm_models : [])
+        .find(x => x && x.id === cur);
+      askModelInfo = {id: cur, label: (m && m.label) || cur};
+    }
+    setAskModelChip(false);   // fill the chip even if the window opened first
+  }catch(e){ /* keep whatever we had; the streamed event still fills it */ }
+}
+function setAskModelChip(force){
+  const chip = $("askmodel");
+  if(!chip || !askModelInfo) return;
+  if(chip.textContent && !force) return;  // a streamed ACTUAL model wins
+  chip.textContent = askModelInfo.label || askModelInfo.id || "";
+  chip.title = askModelInfo.id || "";
+}
+loadAskModelInfo();
 function openAsk(){
+  setAskModelChip(false);
   $("ask").style.display = "flex";
   document.querySelector("#ask .askcard")._raise?.();   // bring to front when opened
   $("askq").focus();
@@ -3307,6 +3338,12 @@ async function runAsk(){
       if(label) addStep(askEscText(label), "askphase");
     }else if(ev.type === "sources"){
       pendingSources = ev.sources;
+    }else if(ev.type === "model"){
+      // The model actually answering (the CLI announces it even on
+      // "default") — pinned in the window header, raw id on hover.
+      const chip = $("askmodel");
+      if(chip){ chip.textContent = ev.label || ev.id || "";
+                chip.title = ev.id || ""; }
     }else if(ev.type === "thinking"){
       addStep(askEscText(ev.text));
     }else if(ev.type === "tool"){
@@ -3747,7 +3784,9 @@ async function removeAccount(label){
 
 /* ----- LLM model (Settings → LLM Model) ----- */
 // Reads the persisted model from /api/settings and writes changes back. The
-// chosen model is passed to `claude -p --model` by the /api/ask backend.
+// dropdown is built from llm_models — every model the Anthropic Models API
+// currently serves (server-cached) — so new releases appear without a code
+// change. The chosen id is passed to `claude -p --model` by the backend.
 async function loadLlmModel(){
   const sel = $("llmmodel"), msg = $("llmmsg");
   if(!sel) return;
@@ -3755,7 +3794,21 @@ async function loadLlmModel(){
   try{
     const r = await fetch("api/settings", {cache: "no-store"});
     const d = await r.json();
-    sel.value = d.llm_model || "default";
+    const cur = d.llm_model || "default";
+    const models = Array.isArray(d.llm_models) ? d.llm_models : [];
+    sel.innerHTML = "";
+    const add = (v, t) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = t; sel.appendChild(o);
+    };
+    add("default", "Default (Claude Code)");
+    for(const m of models){ if(m && m.id) add(m.id, m.label || m.id); }
+    // A saved model that has since left the live list still shows (marked),
+    // so the selection is visible rather than silently looking like another.
+    if(cur !== "default" && ![...sel.options].some(o => o.value === cur)){
+      add(cur, cur + " (saved)");
+    }
+    sel.value = cur;
   }catch(e){ /* leave the current selection */ }
 }
 
@@ -3770,6 +3823,12 @@ async function saveLlmModel(){
     if(!d.ok){ msg.textContent = d.error || "could not save"; return; }
     sel.value = d.llm_model || "default";
     msg.textContent = "Saved ✓";
+    // Re-pin the Ask header chip to the new choice (force: the previously
+    // streamed actual model no longer reflects what the next ask will use).
+    const opt = sel.options[sel.selectedIndex];
+    askModelInfo = {id: sel.value === "default" ? "" : sel.value,
+                    label: opt ? opt.textContent : sel.value};
+    setAskModelChip(true);
   }catch(e){ msg.textContent = "network error"; }
 }
 
@@ -3891,9 +3950,11 @@ $("memtext").addEventListener("keydown", e => {
 $("memlearn").addEventListener("change", saveAutoLearn);
 
 /* ----- Claude OAuth (Settings → Claude OAuth) ----- */
-// Surfaces the Claude Code subscription login that `claude -p` (Liam) uses.
-// "Sign in" launches `claude auth login` server-side (opens a browser); we
-// then poll /api/claude/status until the login settles.
+// Surfaces the auth `claude -p` (Liam) uses. Preferred: a long-lived token
+// minted with `claude setup-token` and pasted here (headless, bills the
+// subscription, survives restarts). Fallback: the interactive browser login —
+// "Sign in" launches `claude auth login` server-side; we then poll
+// /api/claude/status until the login settles.
 let CLAUDE_POLL = null;
 
 function stopClaudePoll(){
@@ -3920,10 +3981,22 @@ async function renderClaudeAuth(){
     return;
   }
   const authed = !!d.loggedIn;
+  if(d.token){
+    // Headless token auth (claude setup-token) — the recommended state.
+    box.innerHTML =
+      '<div class="cainfo"><div class="caemail">Subscription token</div>'
+      + '<div class="cameta">' + esc(d.authMethod || "OAuth token")
+      + ' · every Liam call uses your Claude subscription</div></div>'
+      + '<span class="castatus ok">✓ token configured</span>'
+      + '<div class="caacts"><button class="catokrm">Remove token</button>'
+      + '</div>';
+    box.querySelector(".catokrm").addEventListener("click", claudeTokenRemove);
+    return;
+  }
   const sub = d.subscriptionType ? (" · " + esc(d.subscriptionType)) : "";
   const meta = authed
     ? (esc(d.authMethod || "claude.ai") + sub)
-    : "sign in to use Liam";
+    : "add a token (or sign in) to use Liam";
   const loginRunning = d.login && d.login.running;
   const loginUrl = d.login && d.login.url;
   box.innerHTML =
@@ -3937,7 +4010,16 @@ async function renderClaudeAuth(){
     + (loginRunning ? "Signing in…" : (authed ? "Reconnect" : "Sign in"))
     + '</button>'
     + (authed ? '<button class="calogout">Log out</button>' : '')
-    + '</div>';
+    + '</div>'
+    + '<div class="catok" style="flex-basis:100%;display:flex;gap:6px;'
+    + 'align-items:center;margin-top:6px">'
+    + '<input class="catokin" type="password" autocomplete="off" '
+    + 'spellcheck="false" placeholder="paste sk-ant-oat01-… token" '
+    + 'style="flex:1;min-width:0">'
+    + '<button class="catoksave">Use token</button></div>'
+    + '<div class="cameta" style="flex-basis:100%">Recommended: run '
+    + '<code>claude setup-token</code> in a terminal and paste the token — '
+    + 'headless auth on your subscription, no browser sign-in to renew.</div>';
   if(loginRunning && loginUrl){
     const hint = document.createElement("div");
     hint.className = "cameta";
@@ -3954,6 +4036,47 @@ async function renderClaudeAuth(){
   }
   const lout = box.querySelector(".calogout");
   if(lout) lout.addEventListener("click", claudeLogout);
+  const tin = box.querySelector(".catokin");
+  const tsave = box.querySelector(".catoksave");
+  const saveTok = () => claudeTokenSave(tin.value, tsave);
+  tsave.addEventListener("click", saveTok);
+  tin.addEventListener("keydown", e => {
+    if(e.key === "Enter"){ e.preventDefault(); e.stopPropagation(); saveTok(); }
+  });
+}
+
+async function claudeTokenSave(token, btn){
+  token = (token || "").trim();
+  if(!token){ alert("Paste a token first (run `claude setup-token`)."); return; }
+  if(btn){ btn.disabled = true; btn.textContent = "Saving…"; }
+  let d = {};
+  try{
+    const r = await fetch("api/claude/token", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token})});
+    d = await r.json();
+  }catch(e){ d = {ok: false, error: "network error"}; }
+  if(!d.ok){
+    if(btn){ btn.disabled = false; btn.textContent = "Use token"; }
+    alert("Could not save token: " + (d.error || "error"));
+    return;
+  }
+  renderClaudeAuth();
+}
+
+async function claudeTokenRemove(){
+  if(!confirm("Remove the Claude token?\n\nLiam falls back to the CLI's own "
+      + "sign-in (if any) — otherwise it stops working until you add a token "
+      + "or sign in again.\n\nContinue?")) return;
+  let d = {};
+  try{
+    const r = await fetch("api/claude/token", {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token: ""})});
+    d = await r.json();
+  }catch(e){ alert("network error"); return; }
+  if(!d.ok){ alert("Could not remove token: " + (d.error || "error")); return; }
+  renderClaudeAuth();
 }
 
 async function claudeLogin(){
@@ -4954,14 +5077,17 @@ function _rebuildIndices(){
   // Rebuild the account-filter dropdown so any new accounts are clickable.
   buildAcctFilter();
 
-  // Buckets may have grown (lite mail newly loaded). Unlike accounts, do NOT
-  // auto-select new buckets — lite stays opt-in. 'primary' is always offered;
-  // bucketSel (preserved across the swap) just drops any vanished bucket.
+  // Buckets may have grown (lite mail newly loaded). Mirror accounts: newly
+  // seen buckets get auto-selected so their mail doesn't sit invisible behind
+  // a stale "all selected" filter; bucketSel (preserved across the swap)
+  // drops any vanished bucket.
+  const prevB = new Set(BUCKETS);
   BUCKETS = [...new Set(MSGS.map(m => m.bucket).filter(Boolean))]
     .sort((a, b) => BUCKET_ORDER.indexOf(a) - BUCKET_ORDER.indexOf(b));
   if(!BUCKETS.includes("primary")) BUCKETS.unshift("primary");
   for(const b of [...bucketSel]) if(!BUCKETS.includes(b)) bucketSel.delete(b);
-  if(bucketSel.size === 0) bucketSel.add("primary");
+  for(const b of BUCKETS) if(!prevB.has(b)) bucketSel.add(b);
+  if(bucketSel.size === 0) BUCKETS.forEach(b => bucketSel.add(b));
   buildBucketFilter();
 }
 
