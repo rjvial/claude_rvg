@@ -50,7 +50,7 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from _common import ROOT, bootstrap_venv, force_utf8  # noqa: E402
+from _common import ROOT, bootstrap_venv, claude_env, force_utf8  # noqa: E402
 
 force_utf8()
 bootstrap_venv()
@@ -258,6 +258,11 @@ def _run_claude(prompt: str) -> dict:
     if not claude:
         return {"error": "the `claude` CLI is not on PATH"}
     cmd = [claude, "-p", "--output-format", "stream-json", "--verbose",
+           # Only the project's neo4j MCP server — mirrors serve_app's ask
+           # path; inheriting user-scope MCP servers would flip the CLI into
+           # deferred-tool (ToolSearch) mode and skew the eval.
+           "--mcp-config", str(ROOT / ".mcp.json"),
+           "--strict-mcp-config",
            "--allowedTools", ALLOWED_TOOLS,
            "--append-system-prompt", serve_app.ASK_SYSTEM]
     if claude.lower().endswith((".cmd", ".bat")):
@@ -265,7 +270,7 @@ def _run_claude(prompt: str) -> dict:
     try:
         proc = subprocess.run(cmd, cwd=ROOT, input=prompt, capture_output=True,
                               text=True, encoding="utf-8", errors="replace",
-                              timeout=CLAUDE_TIMEOUT)
+                              timeout=CLAUDE_TIMEOUT, env=claude_env())
     except subprocess.TimeoutExpired:
         return {"error": f"timed out after {CLAUDE_TIMEOUT}s"}
 

@@ -155,6 +155,56 @@ NEO4J_JAVA_HOME = Path(os.environ.get(
 NEO4J_SERVICE = os.environ.get("CLAUDE_RVG_NEO4J_SERVICE", "neo4j")
 
 
+# --- Claude Code headless auth (Max subscription, no browser login) ---------
+# Liam's `claude -p` calls authenticate with a long-lived OAuth token minted by
+# `claude setup-token` (sk-ant-oat01-…, bills the Claude subscription — no API
+# key). The token lives in data/ next to the Gmail OAuth material; a shell-set
+# CLAUDE_CODE_OAUTH_TOKEN is the fallback so launcher-script setups keep
+# working. When neither exists, `claude -p` falls back to whatever interactive
+# `claude auth login` credential the CLI has stored.
+CLAUDE_TOKEN_FILE = DATA_DIR / "claude_oauth_token.txt"
+
+
+def claude_oauth_token() -> str:
+    """The configured Claude Code OAuth token, or '' when none is set."""
+    try:
+        tok = CLAUDE_TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    return (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+
+
+def save_claude_oauth_token(token: str) -> None:
+    """Persist (or, with an empty token, remove) the headless-auth token.
+    Atomic write so a crash can't leave a truncated token that breaks every
+    Liam call with an auth error."""
+    token = (token or "").strip()
+    if not token:
+        try:
+            CLAUDE_TOKEN_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_TOKEN_FILE.with_suffix(".txt.tmp")
+    tmp.write_text(token + "\n", encoding="utf-8")
+    os.replace(tmp, CLAUDE_TOKEN_FILE)
+
+
+def claude_env() -> dict | None:
+    """Environment for `claude` child processes: os.environ plus the configured
+    CLAUDE_CODE_OAUTH_TOKEN. Returns None (inherit untouched) when no token is
+    configured, so passing env=claude_env() is always safe."""
+    tok = claude_oauth_token()
+    if not tok:
+        return None
+    env = os.environ.copy()
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
+    return env
+
+
 def force_utf8() -> None:
     """UTF-8 everywhere — env (for child processes) + this process' streams."""
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")

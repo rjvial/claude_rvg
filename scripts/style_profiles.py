@@ -35,7 +35,7 @@ import threading
 import time
 import unicodedata
 
-from _common import DATA_DIR, ROOT, neo4j_driver
+from _common import DATA_DIR, ROOT, claude_env, neo4j_driver
 
 STORE = DATA_DIR / "style_profiles.json"
 # User-editable alias map: groups of email addresses that belong to ONE person
@@ -262,7 +262,8 @@ def _distill_card(name: str, samples: list[str], claude: str) -> str:
     try:
         out = subprocess.run(cmd, cwd=ROOT, input=user, capture_output=True,
                              text=True, encoding="utf-8", errors="replace",
-                             timeout=120, creationflags=_NO_WINDOW)
+                             timeout=120, creationflags=_NO_WINDOW,
+                             env=claude_env())
     except Exception as e:
         print(f"[style] distill call failed for {name}: {type(e).__name__}")
         return ""
