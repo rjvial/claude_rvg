@@ -45,16 +45,16 @@ from _common import EXCLUDED_CATEGORIES
 # Editing this list invalidates every existing token (Google requires
 # re-consent on any scope change) — re-run `--auth` per account after a change.
 #
-# gmail.compose covers BOTH users.drafts.create (save-as-draft) and
-# users.messages.send (send directly). It does NOT include read access, so we
-# keep gmail.readonly alongside it for the pull/sync path.
-# gmail.modify adds label management (used by users.messages.trash for the
-# "remove" feature in the UI). It does NOT include permanent deletion —
-# trashed messages stay recoverable from Gmail's UI for 30 days.
+# The full-mailbox scope supersedes gmail.readonly + gmail.compose +
+# gmail.modify, and is the ONLY scope Google accepts for the Trash view's
+# explicit "Delete forever" (users.messages.delete / batchDelete). The app's
+# default "remove" stays Gmail-standard (Trash, recoverable 30 days, then
+# auto-purged) — only that opt-in button deletes permanently.
+# Tokens consented under the old granular scopes keep working for everything
+# except Delete forever (load_credentials doesn't force this list onto stored
+# tokens); re-run `--auth` per account to unlock it.
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
 
@@ -110,7 +110,13 @@ def load_credentials(label: str) -> Credentials | None:
     p = token_path(label)
     if not p.exists():
         return None
-    creds = Credentials.from_authorized_user_file(str(p), SCOPES)
+    # No scopes arg: the credential keeps whatever scopes the user actually
+    # consented to. Passing SCOPES would make refresh raise once this list
+    # grows beyond an old token's grant (Google never upscopes on refresh),
+    # bricking sync until every account re-consents. Instead, old tokens keep
+    # working and only the calls needing a new scope fail (as 403s with a
+    # reconnect hint) until that account re-runs --auth.
+    creds = Credentials.from_authorized_user_file(str(p))
     if creds and creds.valid:
         return creds
     if creds and creds.expired and creds.refresh_token:

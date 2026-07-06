@@ -61,27 +61,35 @@ def load_state(label: str) -> dict:
 
 def history_delta(service, start_history_id: str
                   ) -> tuple[list[str], set[str], set[str],
-                             set[str], set[str]]:
+                             set[str], set[str], set[str]]:
     """Returns (added_ids, became_read, became_unread, became_spam,
-    became_not_spam) since start_history_id.
+    became_not_spam, untrashed) since start_history_id.
 
       added_ids       — message IDs newly added (messageAdded).
       became_read     — IDs whose UNREAD label was removed (read elsewhere).
       became_unread   — IDs that gained the UNREAD label (re-flagged unread).
       became_spam     — IDs that gained the SPAM label (marked spam elsewhere).
       became_not_spam — IDs whose SPAM label was removed (un-spammed elsewhere).
+      untrashed       — IDs whose TRASH label was removed (restored from
+                        Trash — by the app's Trash view or Gmail's own UI).
+                        Trashing purges a message from the graph and the
+                        pulled-ids tracker, so a restore must re-import it:
+                        run_sync feeds these into the fetch list, where the
+                        pulled-ids dedup keeps already-known mail cheap.
 
     For each label we track the net state across the window (last event for a
     message wins), so a message toggled more than once lands in one bucket.
     Deriving spam from history (not a raw in:spam diff) keeps purged spam from
     being resurfaced: Gmail's ~30-day auto-delete is a messagesDeleted event,
-    not a SPAM-label removal, so it never lands in became_not_spam.
+    not a SPAM-label removal, so it never lands in became_not_spam (nor, being
+    a delete rather than a TRASH-label removal, in untrashed).
 
     Raises HttpError 404 if start_history_id is too old (~>7 days).
     """
     added: set[str] = set()
     unread_state: dict[str, bool] = {}     # mid -> is UNREAD after last event
     spam_state: dict[str, bool] = {}       # mid -> is SPAM after last event
+    trash_state: dict[str, bool] = {}      # mid -> is TRASH after last event
     page_token: str | None = None
     while True:
         req = service.users().history().list(
@@ -106,6 +114,8 @@ def history_delta(service, start_history_id: str
                     unread_state[mid] = True
                 if "SPAM" in labels:
                     spam_state[mid] = True
+                if "TRASH" in labels:
+                    trash_state[mid] = True
             for lr in h.get("labelsRemoved", []) or []:
                 labels = lr.get("labelIds") or []
                 mid = (lr.get("message") or {}).get("id")
@@ -115,6 +125,8 @@ def history_delta(service, start_history_id: str
                     unread_state[mid] = False
                 if "SPAM" in labels:
                     spam_state[mid] = False
+                if "TRASH" in labels:
+                    trash_state[mid] = False
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
@@ -122,7 +134,9 @@ def history_delta(service, start_history_id: str
     became_read = {mid for mid, u in unread_state.items() if not u}
     became_spam = {mid for mid, s in spam_state.items() if s}
     became_not_spam = {mid for mid, s in spam_state.items() if not s}
-    return list(added), became_read, became_unread, became_spam, became_not_spam
+    untrashed = {mid for mid, t in trash_state.items() if not t}
+    return (list(added), became_read, became_unread, became_spam,
+            became_not_spam, untrashed)
 
 
 def apply_read_changes(label: str, became_read: set[str],
@@ -244,17 +258,18 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
     became_unread: set[str] = set()
     became_spam: set[str] = set()
     became_not_spam: set[str] = set()
+    untrashed: set[str] = set()
     use_history = state.get("last_history_id") and not args.force_date
 
     if use_history:
         try:
             (new_ids, became_read, became_unread,
-             became_spam, became_not_spam) = history_delta(
+             became_spam, became_not_spam, untrashed) = history_delta(
                 service, state["last_history_id"])
             print(f"history API ({label}) → {len(new_ids)} new, "
                   f"{len(became_read)} read + {len(became_unread)} unread, "
                   f"{len(became_spam)} spam + {len(became_not_spam)} not-spam "
-                  f"label change(s).")
+                  f"label change(s), {len(untrashed)} restored from Trash.")
         except HttpError as e:
             status = getattr(e.resp, "status", None)
             if status == 404:
@@ -306,7 +321,19 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
     except HttpError as e:
         print(f"  spam list failed ({label}): {e}", file=sys.stderr)
 
+    # Mail restored from Trash must be re-imported: trashing purged it from
+    # the graph AND from pulled_msg_ids, so the dedup below re-fetches it.
+    # Restores of mail trashed outside the app (still in both) dedup away.
+    if untrashed:
+        new_ids = list(dict.fromkeys(list(new_ids) + sorted(untrashed)))
+
     pulled = load_pulled_ids(label)
+    # Trashing keeps a message's id in pulled_msg_ids as a TOMBSTONE (see
+    # serve_app._purge_files_and_rebuild) so a sync racing the removal can't
+    # resurrect it via Gmail's lagging in:spam index. A restore-from-Trash is
+    # the one event that lifts the tombstone: drop untrashed ids from the
+    # dedup set so the fetch below re-imports them.
+    pulled -= untrashed
     to_fetch = [i for i in new_ids if i not in pulled]
     print(f"After dedup ({label}): {len(to_fetch)} truly new messages.")
 
@@ -319,6 +346,7 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
     latest_internal_ms: int | None = state.get("last_internal_date_ms")
 
     skipped_drafts = 0
+    skipped_trash = 0
     new_records: list[dict] = []
     with EMAILS_JSONL.open("a", encoding="utf-8") as out:
         for mid in tqdm(to_fetch, desc=f"fetch[{label}]"):
@@ -335,6 +363,16 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
                 append_pulled_id(label, mid)
                 skipped_drafts += 1
                 continue
+            if "TRASH" in rec_labels:
+                # Trashed mail must never (re-)enter the dataset. It can
+                # surface here because Gmail's in:spam search index lags a
+                # removal by a few seconds — a sync fired right after the
+                # app trashes spam still sees those ids listed and would
+                # resurrect them. Mark pulled (tombstone) so it isn't
+                # retried; an untrash event lifts the tombstone above.
+                append_pulled_id(label, mid)
+                skipped_trash += 1
+                continue
             # Categorized mail (promo/social/updates/forums) is NO LONGER
             # dropped — it's kept as a lite-tier node, tagged at load time by
             # message_bucket(). So the incremental path now persists it like any
@@ -350,6 +388,8 @@ def fetch_new_messages(args) -> tuple[list[dict], int]:
 
     if skipped_drafts:
         print(f"  Skipped {skipped_drafts} draft message(s) for {label}.")
+    if skipped_trash:
+        print(f"  Skipped {skipped_trash} trashed message(s) for {label}.")
     save_sync_state(label, latest_history_id, latest_internal_ms)
     return new_records, changed
 

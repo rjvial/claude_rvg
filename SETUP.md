@@ -144,8 +144,11 @@ accounts against it. This is the only manual setup step.
    - User type: **External**.
    - App name: `claude-rvg`; user support email + developer email: your
      primary address.
-   - Scopes: **Add or Remove Scopes** → filter `gmail.readonly` → check
-     `https://www.googleapis.com/auth/gmail.readonly` → **Update**.
+   - Scopes: **Add or Remove Scopes** → filter `mail.google.com` → check
+     `https://mail.google.com/` → **Update**. (Full mailbox access: the Trash
+     view's "Delete forever" uses `messages.batchDelete`, which Google gates
+     behind this scope. In testing mode it works for the listed test users
+     without app verification.)
    - **Test users:** add **all three** Google accounts you want to graph:
      - `you@gmail.com`
      - `you@work.example.com`

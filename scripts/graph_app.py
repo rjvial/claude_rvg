@@ -657,6 +657,45 @@ PAGE = r"""<!DOCTYPE html>
   #hdr #markspambtn{background:#B0742E;color:#fff;border-color:#946326}
   #hdr #markspambtn:hover{background:#946326}
   #hdr #markspambtn:disabled{opacity:.55;cursor:default}
+  /* Trash view — a live proxy of Gmail's Trash (trashed mail is purged from
+     the local graph, so these rows come from /api/trashlist on open). Rows
+     mirror the main list's .lrow columns (account dot, date, sender, subject)
+     plus a sender-domain column; the toolbar carries a domain multi-select
+     (reusing the .acctf menu component) to filter by domain. Scrolls like
+     the thread view: its own absolutely-positioned container. */
+  #trashview{display:none;position:absolute;top:46px;left:0;right:0;
+    bottom:26px;overflow:auto;padding:0 0 30px}
+  #trashview .tv-bar{position:sticky;top:0;z-index:5;display:flex;gap:10px;
+    align-items:center;padding:8px 16px;background:var(--bg);
+    border-bottom:1px solid var(--line)}
+  #trashview .tv-bar button{background:var(--surface);color:var(--ink-2);
+    border:1px solid var(--line-2);border-radius:6px;padding:5px 10px;
+    font-size:11.5px;cursor:pointer}
+  #trashview .tv-bar button:hover{background:var(--hover)}
+  #trashview .tv-bar button:disabled{opacity:.55;cursor:default}
+  /* Restore = safe blue (like Not-spam); Delete forever = destructive red. */
+  #trashview #tv-restore:not(:disabled){background:#3F5F8A;color:#fff;
+    border-color:#34507A}
+  #trashview #tv-restore:not(:disabled):hover{background:#34507A}
+  #trashview #tv-del:not(:disabled){background:#8A3F3F;color:#fff;
+    border-color:#7A3434}
+  #trashview #tv-del:not(:disabled):hover{background:#7A3434}
+  #trashview .tv-note{color:var(--ink-3);font-size:11.5px;margin-left:auto}
+  #trashview .tv-domf{width:200px;flex:none}
+  /* Column-label band echoing #cols' placement over the rows. */
+  #trashview .tv-hdr{display:flex;align-items:center;gap:9px;padding:4px 16px;
+    background:var(--surface);border-bottom:1px solid var(--line);
+    color:var(--ink-3);font-size:11px;white-space:nowrap}
+  #trashview .tvrow{display:flex;align-items:center;gap:9px;height:28px;
+    padding:0 16px;cursor:pointer;border-bottom:1px solid var(--line);
+    white-space:nowrap}
+  #trashview .tvrow:hover{background:var(--hover)}
+  #trashview .tvrow>span,#trashview .tv-hdr>span{
+    overflow:hidden;text-overflow:ellipsis}
+  /* Checkbox column is always live in Trash (no separate select mode). */
+  #trashview .c-sel{display:flex}
+  #trashview .c-dom{width:180px;flex:none;color:var(--ink-2)}
+  #trashview .tv-empty{margin:22px 16px;color:var(--ink-3)}
   /* Bucket (tier) filter — multi-select dropdown in the header bar, replacing
      the old Spam toggle. Reuses the .acctf menu styling; sized to fit the bar
      and accent-highlighted when a non-default tier set is active. */
@@ -707,6 +746,10 @@ PAGE = r"""<!DOCTYPE html>
   .acctf .opt i{flex:none}
   .acctf .opt.all{border-bottom:1px solid var(--line);border-radius:0;
     margin:0 0 3px;padding-bottom:6px}
+  /* Trash entry in the bucket menu — separated: it's Gmail's Trash folder
+     (a different page), not one of the graph's bucket tiers. */
+  .acctf .opt.trashopt{border-top:1px solid var(--line);border-radius:0;
+    margin:3px 0 0;padding-top:6px}
   #list{position:absolute;top:78px;left:0;right:0;bottom:26px;overflow:auto}
   #spacer{position:relative}
   .lrow{position:absolute;left:0;right:0;height:28px;display:flex;
@@ -1254,7 +1297,7 @@ PAGE = r"""<!DOCTYPE html>
   <button id="composebtn" title="Compose a new message">✎ Compose</button>
   <button id="refresh" style="display:none" title="Pull new mail now">↻ Sync</button>
   <div class="acctf bucketf" id="bucketf"
-    title="Filter by mail bucket (primary vs promotions/social/updates/forums/spam)"></div>
+    title="Filter by mail bucket (primary vs promotions/social/updates/forums/spam) or open Gmail Trash"></div>
   <button id="acctsbtn" title="Settings: email accounts, LLM model, Claude sign-in">⚙ Settings</button>
   <button id="powerbtn" title="Close the app — stops the mail server first">⏻</button>
 </div>
@@ -1356,6 +1399,7 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="list"><div id="spacer"></div></div>
 <div id="thread"></div>
+<div id="trashview"></div>
 <aside id="panel"></aside>
 <div id="clrpop">
   <div class="clrhd"><span class="ttl" id="clrttl">Account color</span>
@@ -1552,7 +1596,8 @@ let CONVPOS = computeConvPos();
 // message sharing this one's Gmail thread (tid + account) via /api/seen —
 // which also drops the label from each Neo4j node — and flip the local flags
 // so the list un-bolds on the next render. Live-mode only; on the static file
-// the fetch no-ops.
+// the fetch fails and the flip is reverted (rows stay bold — truthful, since
+// Gmail was never told).
 function markRead(gi){
   const m = MSGS[gi];
   if(!m || !m.unread) return;
@@ -1565,12 +1610,22 @@ function markRead(gi){
     : [m]);
   if(!targets.length) return;
   targets.forEach(o => { o.unread = false; });   // optimistic — un-bolds list
+  // Revert the optimistic flip for anything Gmail did NOT accept, so the app
+  // never shows "read" that isn't true globally (a silently-failed call used
+  // to leave the row un-bolded here while every other client kept it unread).
+  const revert = os => { os.forEach(o => { o.unread = true; }); renderList(); };
   fetch("api/seen", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({messages: targets.map(o =>
       ({mid: o.mid, acct: o.acct}))}),
-  }).catch(() => {});
+  }).then(r => r.json()).then(d => {
+    if(!d.ok && !d.marked){ revert(targets); return; }
+    const failedKeys = new Set(
+      (d.failed || []).map(f => remKey({mid: f.mid, acct: f.acct})));
+    const back = targets.filter(o => failedKeys.has(remKey(o)));
+    if(back.length) revert(back);
+  }).catch(() => revert(targets));
 }
 
 /* ===================== LIST VIEW (virtualized) ===================== */
@@ -2272,8 +2327,14 @@ async function removeSelected(){
     // Mark trashed messages (by stable key) as removed in the local view. The
     // server's page-cache rebuild runs in the background and eventually bumps
     // the version; until then — and across any sync/refresh in between — the
-    // REMOVED set keeps these rows hidden so they can't reappear.
-    for(const i of targets) REMOVED.add(remKey(MSGS[i]));
+    // REMOVED set keeps these rows hidden so they can't reappear. Rows whose
+    // removal FAILED stay visible so the user can see and retry them.
+    const failedKeys = new Set(
+      (d.failed || []).map(f => remKey({mid: f.mid, acct: f.acct})));
+    for(const i of targets){
+      const k = remKey(MSGS[i]);
+      if(!failedKeys.has(k)) REMOVED.add(k);
+    }
     exitSelectMode();          // also clears SELECTED, hides Remove btn
     rebuildList();             // re-filter view, drop the trashed rows
     triggerFullSync();         // pull every account so server truth catches up
@@ -2321,7 +2382,13 @@ async function markReadSelected(){
         + d.failed.slice(0,3).map(f => `  ${f.mid}: ${f.error}`).join("\n")
         + (d.failed.length > 3 ? `\n  …and ${d.failed.length - 3} more` : ""));
     }
-    for(const i of targets) MSGS[i].unread = false;   // optimistic un-bold
+    // Un-bold only what Gmail actually accepted — rows whose mark FAILED stay
+    // bold so the app never shows "read" that isn't true globally.
+    const failedKeys = new Set(
+      (d.failed || []).map(f => remKey({mid: f.mid, acct: f.acct})));
+    for(const i of targets){
+      if(!failedKeys.has(remKey(MSGS[i]))) MSGS[i].unread = false;
+    }
     exitSelectMode();          // clears SELECTED, hides the select-mode buttons
     rebuildList();             // re-render (drops bold; re-applies is:unread)
     triggerFullSync();         // pull every account so server truth catches up
@@ -2433,6 +2500,257 @@ async function markAsSpamSelected(){
   }
 }
 $("markspambtn").addEventListener("click", markAsSpamSelected);
+
+/* ===================== TRASH VIEW (live Gmail proxy) ==================== */
+// Trashed mail is purged from the local graph by design, so this view
+// fetches /api/trashlist on open and renders straight from Gmail. Restore
+// moves a message back to the Inbox (the next sync re-imports it into the
+// graph via history untrash-detection); Delete forever is Gmail's permanent
+// batchDelete (needs the full-mailbox scope — the server's error message
+// carries a reconnect hint when an account's token predates it).
+let trashOpen = false;
+let TRASHROWS = [];         // [{mid, acct, from, subj, sent, dom, sel}]
+let TRASHMETA = {totals: {}, errors: []};
+let tvDomSel = new Set();   // sender domains currently shown (like acctSel)
+
+function fromDisp(f){
+  const m = String(f || "").match(/^\s*"?([^"<]+?)"?\s*</);
+  return (m ? m[1] : f) || "(unknown)";
+}
+function emailOf(f){
+  const m = String(f || "").match(/<([^>]+)>/);
+  const e = (m ? m[1] : String(f || "")).trim();
+  return e.includes("@") ? e : "";
+}
+function domOf(f){
+  const e = emailOf(f);
+  return e ? e.split("@").pop().toLowerCase() : "(unknown)";
+}
+const tvVisible = () => TRASHROWS.filter(r => tvDomSel.has(r.dom));
+
+function openTrashView(){
+  if(selectMode) exitSelectMode();
+  thrOpen = false; trashOpen = true;
+  $("list").style.display = "none";
+  $("cols").style.display = "none";
+  $("thread").style.display = "none";
+  $("leftctl").style.display = "none";
+  $("selbtn").style.display = "none";
+  // The bucket dropdown STAYS visible — Trash is one of its options, and
+  // picking any other bucket there is how the user leaves this page.
+  $("search").style.display = "none";
+  $("back").textContent = "← All mail";
+  $("back").style.display = "inline-block";
+  $("title").textContent = "Trash";
+  $("title").style.display = "";
+  syncBucket();                  // dropdown label reads "Trash", rest unticked
+  closePanel();
+  const tv = $("trashview");
+  tv.style.display = "block";
+  tv.innerHTML = `<div class="tv-empty">Loading Gmail Trash…</div>`;
+  fetch("api/trashlist").then(r => r.json()).then(d => {
+    if(!trashOpen) return;           // user navigated away while loading
+    TRASHROWS = [];
+    TRASHMETA = {totals: {}, errors: d.errors || []};
+    (d.accounts || []).forEach(a => {
+      TRASHMETA.totals[a.acct] = a.total || 0;
+      (a.messages || []).forEach(m =>
+        TRASHROWS.push({...m, dom: domOf(m.from), sel: false}));
+    });
+    // One flat date-sorted list across accounts — same shape as the main
+    // mail list (the account column carries the mailbox, not sections).
+    TRASHROWS.sort((a, b) => (b.sent || "").localeCompare(a.sent || ""));
+    tvDomSel = new Set(TRASHROWS.map(r => r.dom));   // all domains shown
+    renderTrashView();
+  }).catch(e => {
+    if(trashOpen) tv.innerHTML =
+      `<div class="tv-empty">Could not load Trash: ${esc(e)}</div>`;
+  });
+}
+
+// Domain dropdown label — mirrors the account/bucket filters' display rule.
+function tvDomLabel(doms){
+  if(!doms.length) return "No domains";
+  if(tvDomSel.size === doms.length) return "All domains";
+  if(tvDomSel.size === 1) return [...tvDomSel][0];
+  return `${tvDomSel.size} domains`;
+}
+
+function renderTrashView(){
+  const tv = $("trashview");
+  // Distinct sender domains with row counts, busiest first — the dropdown's
+  // option list (recomputed every render so counts track deletions).
+  const domCount = {};
+  TRASHROWS.forEach(r => { domCount[r.dom] = (domCount[r.dom] || 0) + 1; });
+  const doms = Object.keys(domCount)
+    .sort((a, b) => domCount[b] - domCount[a] || a.localeCompare(b));
+  const totals = Object.keys(TRASHMETA.totals)
+    .map(a => `${esc(a)} ${TRASHMETA.totals[a]}`).join(" · ");
+  const shown = tvVisible();
+
+  let h = `<div class="tv-bar">
+    <input type="checkbox" id="tv-all" title="Select all visible rows">
+    <button id="tv-restore" disabled>📥 Restore (0)</button>
+    <button id="tv-del" disabled>🗑 Delete forever (0)</button>
+    <div class="acctf tv-domf" id="tvdomf" title="Filter by sender domain">
+      <div class="btn"><span class="lbl">${esc(tvDomLabel(doms))}</span>
+        <span class="car">▾</span></div>
+      <div class="menu">
+        <label class="opt all"><input type="checkbox" id="tvdom-all"`
+          + `${tvDomSel.size === doms.length ? " checked" : ""}>
+          <span>All domains</span></label>`
+    + doms.map(dm =>
+      `<label class="opt"><input type="checkbox" data-dom="${esc(dm)}"`
+        + `${tvDomSel.has(dm) ? " checked" : ""}>`
+        + `<span>${esc(dm)} (${domCount[dm]})</span></label>`).join("")
+    + `</div></div>
+    <span class="tv-note">In Trash: ${totals || "—"} · auto-purged by Gmail
+      after ~30 days · Restore returns to the Inbox</span></div>`;
+
+  h += `<div class="tv-hdr">
+      <span class="c-sel"></span>
+      <span class="c-acct">account</span>
+      <span class="c-date">date</span>
+      <span class="c-from">sender</span>
+      <span class="c-dom">domain</span>
+      <span class="c-subj">subject</span></div>`;
+
+  if(!shown.length){
+    h += `<div class="tv-empty">${TRASHROWS.length
+      ? "No trashed messages match the domain filter."
+      : "Trash is empty in every account."}</div>`;
+  }
+  for(const r of shown){
+    const i = TRASHROWS.indexOf(r);
+    h += `<label class="tvrow">`
+      + `<span class="c-sel"><input type="checkbox" data-i="${i}"`
+      + `${r.sel ? " checked" : ""}></span>`
+      + `<span class="c-acct lacct"><i class="acctdot" style="background:`
+      + `${ACCT_COLOR[r.acct] || "#8F8B80"}"></i>${esc(r.acct)}</span>`
+      + `<span class="c-date ldate">${esc(dstr(r.sent))}</span>`
+      + `<span class="c-from lfrom" title="${esc(r.from)}">`
+      + `${esc(fromDisp(r.from))}</span>`
+      + `<span class="c-dom" title="${esc(r.dom)}">${esc(r.dom)}</span>`
+      + `<span class="c-subj lsubj" title="${esc(r.subj)}">`
+      + `${esc(r.subj || "(no subject)")}</span>`
+      + `</label>`;
+  }
+  for(const err of TRASHMETA.errors)
+    h += `<div class="tv-empty">⚠ ${esc(err.acct)}: ${esc(err.error)}</div>`;
+  tv.innerHTML = h;
+
+  tv.querySelectorAll(".tvrow input").forEach(cb =>
+    cb.addEventListener("change", () => {
+      TRASHROWS[+cb.dataset.i].sel = cb.checked;
+      syncTrashBar();
+    }));
+  $("tv-all").addEventListener("change", () => {
+    const on = $("tv-all").checked;
+    tvVisible().forEach(r => { r.sel = on; });
+    tv.querySelectorAll(".tvrow input").forEach(cb => { cb.checked = on; });
+    syncTrashBar();
+  });
+  $("tv-restore").addEventListener("click", () => trashAct("restore"));
+  $("tv-del").addEventListener("click", () => trashAct("delete"));
+
+  // Domain dropdown wiring — mirrors buildAcctFilter's open/close + option
+  // semantics. A filter change drops the selection: destructive actions must
+  // never touch rows the filter just hid.
+  const w = $("tvdomf");
+  w.querySelector(".btn").addEventListener("click", e => {
+    e.stopPropagation();
+    w.classList.toggle("open");
+  });
+  // Clicks inside the menu must not reach the document-level closer — the
+  // change handler re-renders this whole view, so by the time the click
+  // bubbles to document its target is detached and would read as "outside".
+  w.querySelector(".menu").addEventListener("click",
+    e => e.stopPropagation());
+  w.querySelectorAll(".opt input").forEach(cb => {
+    cb.addEventListener("change", () => {
+      if(cb.id === "tvdom-all"){
+        tvDomSel = new Set(cb.checked ? doms : []);
+      } else {
+        cb.checked ? tvDomSel.add(cb.dataset.dom)
+                   : tvDomSel.delete(cb.dataset.dom);
+      }
+      TRASHROWS.forEach(r => { r.sel = false; });
+      renderTrashView();
+      $("tvdomf").classList.add("open");   // keep the menu open while picking
+    });
+  });
+  syncTrashBar();
+}
+// Close the domain dropdown when clicking anywhere outside it (same pattern
+// as the account filter's document-level closer).
+document.addEventListener("click", e => {
+  const w = document.getElementById("tvdomf");
+  if(w && !w.contains(e.target)) w.classList.remove("open");
+});
+
+function syncTrashBar(){
+  const n = tvVisible().filter(r => r.sel).length;
+  $("tv-restore").textContent = `📥 Restore (${n})`;
+  $("tv-del").textContent = `🗑 Delete forever (${n})`;
+  $("tv-restore").disabled = n === 0;
+  $("tv-del").disabled = n === 0;
+}
+
+async function trashAct(kind){
+  // Only visible selected rows — the domain filter also clears selection on
+  // change, so nothing hidden can ever be acted on.
+  const sel = tvVisible().filter(r => r.sel);
+  if(!sel.length) return;
+  const msgs = sel.map(r => ({mid: r.mid, acct: r.acct}));
+  const ask = kind === "restore"
+    ? `Restore ${msgs.length} message(s) from Trash back to the Inbox?`
+    : `PERMANENTLY delete ${msgs.length} message(s)?\n\n`
+      + `This is Gmail's "Delete forever": they are erased immediately `
+      + `and CANNOT be recovered.`;
+  if(!confirm(ask)) return;
+  const rbtn = $("tv-restore"), dbtn = $("tv-del");
+  rbtn.disabled = dbtn.disabled = true;
+  (kind === "restore" ? rbtn : dbtn).textContent =
+    kind === "restore" ? "Restoring…" : "Deleting…";
+  try{
+    const r = await fetch(
+      kind === "restore" ? "api/trash/restore" : "api/trash/delete", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({messages: msgs}),
+      });
+    const d = await r.json();
+    const okN = d.restored || d.deleted || 0;
+    if(d.failed && d.failed.length){
+      alert(`${kind === "restore" ? "Restored" : "Deleted"} ${okN} `
+        + `message(s). ${d.failed.length} failed:\n`
+        + d.failed.slice(0,3).map(f => `  ${f.mid}: ${f.error}`).join("\n")
+        + (d.failed.length > 3 ? `\n  …and ${d.failed.length - 3} more` : ""));
+    } else if(!d.ok && d.error){
+      alert(`${kind === "restore" ? "Restore" : "Delete"} failed: ${d.error}`);
+    }
+    // Drop only the rows Gmail accepted; failed ones stay listed (and stay
+    // selected) so they're visible and retryable.
+    const failedKeys = new Set(
+      (d.failed || []).map(f => f.mid + "|" + f.acct));
+    const okKeys = new Set(sel
+      .filter(r => !failedKeys.has(r.mid + "|" + r.acct))
+      .map(r => r.mid + "|" + r.acct));
+    for(const r of sel){
+      if(okKeys.has(r.mid + "|" + r.acct))
+        TRASHMETA.totals[r.acct] =
+          Math.max(0, (TRASHMETA.totals[r.acct] || 1) - 1);
+    }
+    TRASHROWS = TRASHROWS.filter(r => !okKeys.has(r.mid + "|" + r.acct));
+    renderTrashView();
+    // Restored mail must re-enter the graph — kick a sync so the history
+    // delta's untrash-detection re-imports it without waiting for the timer.
+    if(kind === "restore" && okKeys.size) triggerFullSync();
+  }catch(e){
+    alert("Network error: " + e);
+    renderTrashView();
+  }
+}
 
 // --- account filter: a multi-select dropdown (replaces the text box) -----
 // `let` so _rebuildIndices() can update the list after a payload refresh
@@ -3022,6 +3340,10 @@ async function loadBody(i){
 /* ===================== NAVIGATION ================================== */
 function showList(){
   thrOpen = false; sel = null;
+  trashOpen = false;
+  $("trashview").style.display = "none";
+  $("search").style.display = "";
+  syncBucket();                  // dropdown label back from "Trash"
   $("thread").style.display = "none";
   $("list").style.display = "block";
   $("back").style.display = "none";
@@ -3057,6 +3379,7 @@ function applyColsVisibility(){
 // drops any in-progress selection (a destructive action must never touch
 // hidden rows).
 function bucketDispLabel(){
+  if(trashOpen) return "Trash";
   const n = bucketSel.size;
   if(n === 0) return "None";
   if(n === BUCKETS.length) return "All mail";
@@ -3067,11 +3390,16 @@ function syncBucket(){
   const w = $("bucketf");
   if(!w) return;
   w.querySelector(".lbl").textContent = bucketDispLabel();
-  w.classList.toggle("active", bucketFiltered());
+  w.classList.toggle("active", trashOpen || bucketFiltered());
+  // Trash is exclusive: while it's on, every bucket option shows unticked
+  // (bucketSel itself is preserved, so leaving Trash restores the previous
+  // bucket selection untouched).
   const all = $("bucket-all");
-  if(all) all.checked = bucketSel.size === BUCKETS.length;
+  if(all) all.checked = !trashOpen && bucketSel.size === BUCKETS.length;
   w.querySelectorAll(".opt input[data-b]").forEach(cb =>
-    cb.checked = bucketSel.has(cb.dataset.b));
+    cb.checked = !trashOpen && bucketSel.has(cb.dataset.b));
+  const tr = $("bucket-trash");
+  if(tr) tr.checked = trashOpen;
 }
 function buildBucketFilter(){
   const w = $("bucketf");
@@ -3084,13 +3412,34 @@ function buildBucketFilter(){
     + '<span class="car">▾</span></div><div class="menu">'
     + '<label class="opt all"><input type="checkbox" id="bucket-all">'
     + '<i class="acctdot" style="visibility:hidden"></i>'   // align label
-    + '<span>All mail</span></label>' + opts + '</div>';
+    + '<span>All mail</span></label>' + opts
+    // Trash: not a graph bucket but Gmail's Trash folder, live-proxied by
+    // the Trash page. Off by default and exclusive — ticking it unticks
+    // everything else; ticking anything else leaves the Trash page.
+    + '<label class="opt trashopt"><input type="checkbox" id="bucket-trash">'
+    + '<i class="acctdot" style="visibility:hidden"></i>'
+    + '<span>🗑 Trash</span></label>' + '</div>';
   w.querySelector(".btn").addEventListener("click", e => {
     e.stopPropagation();
     w.classList.toggle("open");
   });
   w.querySelectorAll(".opt input").forEach(cb => {
     cb.addEventListener("change", () => {
+      if(cb.id === "bucket-trash"){
+        dropSelectionOnFilterChange();
+        w.classList.remove("open");      // page swap — fold the menu
+        if(cb.checked){
+          openTrashView();               // exclusive: syncBucket unticks rest
+        } else {
+          showList();                    // back to the buckets as they were
+          $("list").scrollTop = 0;
+          rebuildList();
+        }
+        return;
+      }
+      // Any real bucket (or All mail) while the Trash page is open first
+      // leaves that page, then applies the bucket change as usual.
+      if(trashOpen) showList();
       if(cb.id === "bucket-all"){
         bucketSel.clear();
         if(cb.checked) BUCKETS.forEach(b => bucketSel.add(b));

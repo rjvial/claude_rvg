@@ -40,9 +40,18 @@ Routes:  GET /              the app
                             body, in_reply_to?, references?, thread_id?,
                             attachments?} → {ok, id?, thread_id?, error?}
          POST /api/trash    {messages: [{mid, acct}, …]} → moves each
-                            message to Gmail Trash, purges it from local
-                            data files + Neo4j, rebuilds the cache.
+                            message to Gmail Trash (standard removal:
+                            recoverable 30 days, then auto-purged), purges it
+                            from local data files + Neo4j, rebuilds the cache.
                             Returns {ok, trashed, failed: [{mid,acct,error}]}.
+         GET  /api/trashlist → live snapshot of every account's Gmail Trash
+                            (totals + newest-200 metadata per account); the
+                            graph holds no trashed mail, so this proxies Gmail.
+         POST /api/trash/restore {messages} → un-trash back to the Inbox
+                            (drop TRASH, add INBOX); the next sync re-imports
+                            the mail into the graph.
+         POST /api/trash/delete  {messages} → PERMANENTLY delete (batchDelete;
+                            needs the full https://mail.google.com/ scope).
          POST /api/seen     {messages: [{mid, acct}, …]} → clears the UNREAD
                             label on each message in Gmail + Neo4j (mark read).
                             Returns {ok, marked, failed: [{mid,acct,error}]}.
@@ -83,6 +92,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit, quote
 
@@ -2498,7 +2508,8 @@ def _set_spam_neo4j(spammed: set[tuple[str, str]]) -> None:
 
 def _purge_files_and_rebuild(trashed: set[tuple[str, str]]) -> None:
     """Slow path: rewrite emails.jsonl + emails_clean.jsonl filtering the
-    trashed records out, prune the tracker files, drop orphan Threads, and
+    trashed records out, prune cleaned_msg_ids (pulled ids stay — they
+    tombstone the trashed mail against resurrection), and
     rebuild the page cache. Runs on a background thread because, on Google-
     Drive-backed storage, the emails.jsonl rewrite alone can take 60-90s
     even when nothing actually changes (the whole 750 MB file is re-walked).
@@ -2547,19 +2558,17 @@ def _purge_files_and_rebuild(trashed: set[tuple[str, str]]) -> None:
                 p.write_text("\n".join(kept) + ("\n" if kept else ""),
                              encoding="utf-8")
 
-            # pulled_msg_ids_<acct>.txt — drop the mids per account so a
-            # Gmail-side restore-from-Trash lets a future sync re-fetch them.
-            by_acct: dict[str, set[str]] = {}
-            for a, m in trashed:
-                by_acct.setdefault(a, set()).add(m)
-            for acct, mids in by_acct.items():
-                p = DATA_DIR / f"pulled_msg_ids_{acct}.txt"
-                if not p.exists():
-                    continue
-                kept = [l for l in p.read_text(encoding="utf-8").splitlines()
-                        if l.strip() and l.strip() not in mids]
-                p.write_text("\n".join(kept) + ("\n" if kept else ""),
-                             encoding="utf-8")
+            # pulled_msg_ids_<acct>.txt is deliberately NOT pruned: the ids
+            # stay as TOMBSTONES. Gmail's in:spam search index (and even
+            # messages.get labels) lag a removal by seconds-to-minutes, so
+            # the sync fired right after a remove used to re-list, re-fetch
+            # and resurrect the just-trashed spam with its pre-trash labels
+            # (observed 2026-07-06: 26 messages, one bulk re-load). With the
+            # id still in pulled_msg_ids the dedup skips it no matter what
+            # the lagging listing claims. A restore-from-Trash lifts the
+            # tombstone: sync_incremental subtracts history-untrashed ids
+            # from the dedup set, and the app's own restore re-imports
+            # directly (_reimport_restored).
 
         # Orphan-thread cleanup now happens inline in _purge_neo4j (targeted
         # to the trashed messages' own threads) — no full-Thread scan here.
@@ -2576,8 +2585,11 @@ def _purge_files_and_rebuild(trashed: set[tuple[str, str]]) -> None:
 
 
 def _do_trash(payload: dict) -> dict:
-    """Move each requested message to Gmail Trash, then purge it from local
-    state. Authorization is per-account via the gmail.modify scope."""
+    """Move each requested message to Gmail Trash (standard removal — same as
+    Gmail's own Delete: recoverable for 30 days, then auto-purged), then purge
+    it from local state. Authorization is per-account via the gmail.modify
+    scope. Deliberately NOT a permanent messages.delete: that is irreversible
+    and needs the full https://mail.google.com/ scope."""
     import _send_mail
     items = payload.get("messages") or []
     if not items:
@@ -2618,7 +2630,11 @@ def _do_trash(payload: dict) -> dict:
         # 1000 ids instead of one per message (a 50-message selection used
         # to block the UI for ~20s). All-or-nothing per batch, so on a batch
         # error fall back to per-message trash to salvage the valid ids —
-        # same pattern as _do_mark_read below.
+        # same pattern as _do_mark_read below. SPAM is stripped explicitly:
+        # observed Gmail behavior is to auto-drop SPAM when TRASH is added,
+        # but that's undocumented — a surviving SPAM label would keep the
+        # message in the sync's in:spam listing and re-pull it into the
+        # graph, so don't rely on it.
         for start in range(0, len(mids), 1000):
             chunk = mids[start:start + 1000]
             try:
@@ -2626,7 +2642,7 @@ def _do_trash(payload: dict) -> dict:
                     userId="me",
                     body={"ids": chunk,
                           "addLabelIds": ["TRASH"],
-                          "removeLabelIds": ["INBOX"]}).execute()
+                          "removeLabelIds": ["INBOX", "SPAM"]}).execute()
                 trashed.update((acct, mid) for mid in chunk)
             except Exception:
                 for mid in chunk:
@@ -2852,6 +2868,262 @@ def _do_mark_spam(payload: dict) -> dict:
             "failed": failed}
 
 
+# --- Trash view: live proxy over Gmail's Trash ----------------------------
+# Trashed mail is (by design) purged from the graph and data files, so the
+# Trash page can't render from the local payload — these endpoints hit Gmail
+# directly. Non-interactive auth only (load_credentials): a server request
+# must never pop the OAuth browser flow.
+
+TRASH_LIST_CAP = 200        # newest metadata rows fetched per account
+
+
+def _gmail_service_noauth(acct):
+    """Gmail service from the stored token only. Raises RuntimeError when the
+    account has no token (instead of launching an interactive flow)."""
+    import pull_gmail
+    creds = pull_gmail.load_credentials(acct)
+    if creds is None:
+        raise RuntimeError(f"account '{acct}' is not authorized — sign in "
+                           f"via the ⚙ Accounts panel first")
+    return pull_gmail.build("gmail", "v1", credentials=creds,
+                            cache_discovery=False)
+
+
+def _do_trash_list() -> dict:
+    """Snapshot of every account's Gmail Trash: exact total plus metadata
+    (from / subject / date) for the newest TRASH_LIST_CAP messages. One
+    users.messages.get per row, batched 100 per HTTP round-trip."""
+    import pull_gmail
+    accounts = []
+    errors = []
+    for acct in load_accounts():
+        try:
+            service = _gmail_service_noauth(acct)
+            ids: list[str] = []
+            page = None
+            while True:
+                resp = pull_gmail._exec_with_retry(
+                    service.users().messages().list(
+                        userId="me", q="in:trash", includeSpamTrash=True,
+                        maxResults=500, pageToken=page))
+                ids += [m["id"] for m in (resp.get("messages") or [])]
+                page = resp.get("nextPageToken")
+                if not page:
+                    break
+            rows: list[dict] = []
+            retry: list[str] = []
+
+            def _collect(rid, resp, err):
+                # rid is the message id (request_id below). Individual gets
+                # inside a batch can 429 on Gmail's per-user rate limit even
+                # when the batch itself succeeds — queue those for another
+                # pass instead of silently dropping the row.
+                if err is not None or not resp:
+                    retry.append(rid)
+                    return
+                hdrs = {h["name"].lower(): h["value"] for h in
+                        (resp.get("payload") or {}).get("headers") or []}
+                ts = int(resp.get("internalDate") or 0)
+                rows.append({
+                    "mid": resp["id"], "acct": acct,
+                    "from": hdrs.get("from", ""),
+                    "subj": hdrs.get("subject", ""),
+                    "sent": (datetime.fromtimestamp(
+                        ts / 1000, tz=timezone.utc).isoformat()
+                        if ts else ""),
+                })
+            # list() returns newest-first, so the cap keeps the newest rows.
+            # Batches of 50 (5 quota units per get, 250 units/s per user)
+            # plus up to 3 retry passes over the rate-limited leftovers.
+            pending = ids[:TRASH_LIST_CAP]
+            for attempt in range(4):
+                if not pending:
+                    break
+                if attempt:
+                    time.sleep(1.5 * attempt)
+                retry = []
+                for start in range(0, len(pending), 50):
+                    batch = service.new_batch_http_request(callback=_collect)
+                    for mid in pending[start:start + 50]:
+                        batch.add(service.users().messages().get(
+                            userId="me", id=mid, format="metadata",
+                            metadataHeaders=["From", "Subject"]),
+                            request_id=mid)
+                    pull_gmail._exec_with_retry(batch)
+                pending = retry
+            rows.sort(key=lambda r: r["sent"], reverse=True)
+            accounts.append({"acct": acct, "total": len(ids),
+                             "messages": rows})
+        except Exception as e:
+            errors.append({"acct": acct,
+                           "error": _safe_err("trashlist", e)})
+    return {"ok": len(errors) < len(load_accounts()) or not errors,
+            "accounts": accounts, "errors": errors}
+
+
+def _reimport_restored(restored: set[tuple[str, str]]) -> None:
+    """Background: re-import just-restored messages into the local mirror
+    (emails.jsonl + pulled-ids tombstone refresh + clean + fast graph load +
+    page-cache rebuild). Direct — NOT via the sync's untrash-detection,
+    which can't be trusted right after our own restore: a sync fired seconds
+    later reads Gmail's lagging labels and would tombstone the mail as
+    still-trashed. We know the true post-restore state, so we force it:
+    strip TRASH / ensure INBOX on the fetched record."""
+    import pull_gmail
+    records: list[dict] = []
+    by_acct: dict[str, list[str]] = {}
+    for acct, mid in restored:
+        by_acct.setdefault(acct, []).append(mid)
+    try:
+        for acct, mids in by_acct.items():
+            service = _gmail_service_noauth(acct)
+            email = pull_gmail.get_account_email(service, acct)
+            for mid in mids:
+                try:
+                    rec = pull_gmail.fetch_message(service, mid, acct, email)
+                except Exception as e:
+                    print(f"[serve] restore re-import fetch failed "
+                          f"({acct}/{mid}): {_safe_err('reimport', e)}")
+                    continue
+                labels = [x for x in (rec.get("label_ids") or [])
+                          if x != "TRASH"]
+                if "INBOX" not in labels:
+                    labels.append("INBOX")
+                rec["label_ids"] = labels
+                records.append(rec)
+        if not records:
+            return
+        with _sync_lock:
+            with (DATA_DIR / "emails.jsonl").open(
+                    "a", encoding="utf-8") as out:
+                for rec in records:
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            for rec in records:
+                pull_gmail.append_pulled_id(rec["account_owner"],
+                                            rec["message_id"])
+        _clean_records_inline(records)
+        _fast_load_records(records)
+        rebuild()
+        print(f"[serve] restore: re-imported {len(records)} message(s).")
+    except Exception as e:
+        print(f"[serve] restore re-import failed: {type(e).__name__}: {e}")
+
+
+def _do_trash_restore(payload: dict) -> dict:
+    """Move each requested message out of Gmail Trash and back to the Inbox
+    (drop TRASH, add INBOX — 'revert to normal state'). The graph copy was
+    purged when the message was trashed; _reimport_restored puts it back
+    directly (the sync's untrash-detection covers restores made from
+    Gmail's own UI instead)."""
+    items = payload.get("messages") or []
+    if not items:
+        return {"ok": False, "error": "no messages specified"}
+    valid_accts = load_accounts()
+    by_acct: dict[str, list[str]] = {}
+    for m in items:
+        acct = (m.get("acct") or "").strip()
+        mid = (m.get("mid") or "").strip()
+        if acct in valid_accts and mid:
+            by_acct.setdefault(acct, []).append(mid)
+
+    restored: set[tuple[str, str]] = set()
+    failed: list[dict] = []
+    body = {"removeLabelIds": ["TRASH"], "addLabelIds": ["INBOX"]}
+    for acct, mids in by_acct.items():
+        try:
+            service = _gmail_service_noauth(acct)
+        except Exception as e:
+            for mid in mids:
+                failed.append({"mid": mid, "acct": acct,
+                               "error": _safe_err("restore", e)})
+            continue
+        for start in range(0, len(mids), 1000):
+            chunk = mids[start:start + 1000]
+            try:
+                service.users().messages().batchModify(
+                    userId="me", body={"ids": chunk, **body}).execute()
+                restored.update((acct, mid) for mid in chunk)
+            except Exception:
+                for mid in chunk:
+                    try:
+                        service.users().messages().modify(
+                            userId="me", id=mid, body=body).execute()
+                        restored.add((acct, mid))
+                    except Exception as e:
+                        failed.append({"mid": mid, "acct": acct,
+                                       "error": _safe_err("restore", e)})
+    if restored:
+        threading.Thread(target=_reimport_restored,
+                         args=(restored,), daemon=True).start()
+    return {"ok": len(restored) > 0 or not items,
+            "restored": len(restored), "failed": failed}
+
+
+def _do_trash_delete(payload: dict) -> dict:
+    """PERMANENTLY delete each requested message (Gmail batchDelete — the
+    Trash view's explicit 'Delete forever', never the default remove).
+    Requires the full https://mail.google.com/ scope; tokens consented before
+    that scope was added get a 403 with a reconnect hint. Also purges any
+    graph leftovers (covers mail trashed outside the app, which the graph
+    still carries)."""
+    items = payload.get("messages") or []
+    if not items:
+        return {"ok": False, "error": "no messages specified"}
+    valid_accts = load_accounts()
+    by_acct: dict[str, list[str]] = {}
+    for m in items:
+        acct = (m.get("acct") or "").strip()
+        mid = (m.get("mid") or "").strip()
+        if acct in valid_accts and mid:
+            by_acct.setdefault(acct, []).append(mid)
+
+    deleted: set[tuple[str, str]] = set()
+    failed: list[dict] = []
+
+    def _err(acct, e):
+        msg = _safe_err("delete forever", e)
+        if getattr(getattr(e, "resp", None), "status", None) == 403:
+            msg += (f" — permanent deletion needs the full "
+                    f"https://mail.google.com/ scope: reconnect '{acct}' via "
+                    f"the ⚙ Accounts panel (or `pull_gmail.py --account "
+                    f"{acct} --auth`)")
+        return msg
+
+    for acct, mids in by_acct.items():
+        try:
+            service = _gmail_service_noauth(acct)
+        except Exception as e:
+            for mid in mids:
+                failed.append({"mid": mid, "acct": acct,
+                               "error": _safe_err("delete forever", e)})
+            continue
+        for start in range(0, len(mids), 1000):
+            chunk = mids[start:start + 1000]
+            try:
+                service.users().messages().batchDelete(
+                    userId="me", body={"ids": chunk}).execute()
+                deleted.update((acct, mid) for mid in chunk)
+            except Exception:
+                for mid in chunk:
+                    try:
+                        service.users().messages().delete(
+                            userId="me", id=mid).execute()
+                        deleted.add((acct, mid))
+                    except Exception as e:
+                        failed.append({"mid": mid, "acct": acct,
+                                       "error": _err(acct, e)})
+
+    if deleted:
+        # Normally a no-op (app-trashed mail was purged at trash time), but
+        # mail trashed in Gmail's own UI is still in the graph — drop it.
+        _purge_neo4j(deleted)
+        threading.Thread(target=_purge_files_and_rebuild,
+                         args=(deleted,), daemon=True).start()
+
+    return {"ok": len(deleted) > 0 or not items,
+            "deleted": len(deleted), "failed": failed}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2955,6 +3227,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/boot":
             # Cold-start progress for the loading splash: {ready, phase, error}.
             self._send(200, json.dumps(_boot_snapshot()), "application/json")
+        elif path == "/api/trashlist":
+            # Live snapshot of Gmail's Trash (not in the graph by design).
+            result = _do_trash_list()
+            self._send(200 if result.get("ok") else 502,
+                       json.dumps(result), "application/json")
         elif path == "/api/version":
             with _lock:
                 v = {"version": _state["version"],
@@ -3445,6 +3722,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "application/json")
                 return
             result = _do_trash(payload)
+            self._send(200 if result.get("ok") else 400,
+                       json.dumps(result), "application/json")
+        elif p == "/api/trash/restore":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except (json.JSONDecodeError, ValueError):
+                self._send(400,
+                           json.dumps({"ok": False, "error": "bad JSON"}),
+                           "application/json")
+                return
+            result = _do_trash_restore(payload)
+            self._send(200 if result.get("ok") else 400,
+                       json.dumps(result), "application/json")
+        elif p == "/api/trash/delete":
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                payload = json.loads(self.rfile.read(n) or b"{}")
+            except (json.JSONDecodeError, ValueError):
+                self._send(400,
+                           json.dumps({"ok": False, "error": "bad JSON"}),
+                           "application/json")
+                return
+            result = _do_trash_delete(payload)
             self._send(200 if result.get("ok") else 400,
                        json.dumps(result), "application/json")
         elif p == "/api/seen":
